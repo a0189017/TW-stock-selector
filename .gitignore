@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+
+# Local cache & data
+cache/
+data/cache/
+
+# Generated reports
+reports/
+
+# Personal portfolio data
+portfolio.json
+
+# Local config (contains absolute paths)
+claude_desktop_config_snippet.json
+
+# macOS
+.DS_Store
