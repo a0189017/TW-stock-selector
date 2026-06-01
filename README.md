@@ -33,7 +33,7 @@
 **需求：** Python 3.11+
 
 ```bash
-git clone https://github.com/your-username/TW-stock-selector.git
+git clone https://github.com/a0189017/TW-stock-selector.git
 cd TW-stock-selector
 
 python -m venv venv
