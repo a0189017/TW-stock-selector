@@ -2,6 +2,8 @@
 import json
 from datetime import datetime
 
+from analysis.common import serialize_tech, serialize_chip, serialize_fundamental
+
 
 SYSTEM_PROMPT = """你是一位擁有超過15年台股實戰經驗的選股達人。你的分析風格精準、直白，每句話都有料，不說廢話。
 
@@ -52,23 +54,9 @@ def build_user_prompt(candidates: list[dict], market_summary: dict) -> str:
             "漲跌%": s.get("change_pct", 0),
             "技術評分": s.get("tech_score", 0),
             "技術信號": s.get("tech_signals", []),
-            "技術指標": {
-                "KD(K/D)": f"{s.get('kd_k', 50):.1f}/{s.get('kd_d', 50):.1f}",
-                "MACD柱": f"{s.get('macd_hist', 0):.4f}",
-                "均線乖離(MA5/MA20/MA60)": f"{s.get('bias5', 0):+.1f}%/{s.get('bias20', 0):+.1f}%/{s.get('bias60', 0):+.1f}%",
-                "量比": f"{s.get('vol_ratio', 1):.1f}x",
-                "均線結構": s.get("ma_structure", "整理"),
-                "MA20": s.get("ma20", 0),
-                "MA60": s.get("ma60", 0),
-            },
-            "籌碼": {
-                "外資今日淨買(張)": f"{s.get('foreign_net_today', 0):+,.0f}",
-                "外資5日淨買(張)": f"{s.get('foreign_net_5d', 0):+,.0f}",
-                "投信今日淨買(張)": f"{s.get('trust_net_today', 0):+,.0f}",
-                "三大法人今日(張)": f"{s.get('big3_net_today', 0):+,.0f}",
-                "融資餘額變化": f"{s.get('margin_change_pct', 0):+.1f}%",
-                "融資使用率": f"{s.get('margin_util_rate', 0):.1f}%",
-            },
+            "技術指標": serialize_tech(s),
+            "籌碼": serialize_chip(s),
+            "基本面": serialize_fundamental(s),
         }
         stocks_data.append(entry)
 

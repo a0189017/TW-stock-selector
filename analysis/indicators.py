@@ -52,6 +52,38 @@ def compute_volume_ratio(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_rsi(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """Wilder's RSI."""
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.rename("RSI")
+
+
+def compute_bollinger(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> pd.DataFrame:
+    """
+    Bollinger Bands (n-day SMA ± k×σ).
+    Adds BB_upper, BB_lower, BB_mid, BB_pct (%B), BB_width.
+    """
+    mid = df["Close"].rolling(n).mean()
+    std = df["Close"].rolling(n).std(ddof=0)
+    upper = mid + k * std
+    lower = mid - k * std
+    band_width = (upper - lower).replace(0, np.nan)
+    bb_pct = (df["Close"] - lower) / band_width
+    bb_width = band_width / mid.replace(0, np.nan) * 100  # width as % of mid
+    df["BB_upper"] = upper
+    df["BB_lower"] = lower
+    df["BB_mid"] = mid
+    df["BB_pct"] = bb_pct
+    df["BB_width"] = bb_width
+    return df
+
+
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add all indicators to DataFrame in place."""
     df = df.copy()
@@ -65,13 +97,55 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = compute_mas(df)
     df = compute_bias(df)
     df = compute_volume_ratio(df)
+    df["RSI"] = compute_rsi(df)
+    df = compute_bollinger(df)
     return df
 
 
-def score_stock(df: pd.DataFrame) -> tuple[int, list[str]]:
+def compute_relative_strength(stock_df: pd.DataFrame,
+                              bench_df: pd.DataFrame | None,
+                              windows=(20, 60)) -> dict:
+    """
+    Relative strength = stock return − benchmark (TAIEX) return over each window.
+    Positive RS = outperforming the index. Returns {rs20, rs60, rs_label}.
+    Empty dict if benchmark unavailable or histories too short.
+    """
+    if bench_df is None or bench_df.empty or stock_df is None or stock_df.empty:
+        return {}
+
+    s_close = stock_df["Close"].dropna()
+    b_close = bench_df["Close"].dropna()
+    if len(s_close) < max(windows) + 1 or len(b_close) < max(windows) + 1:
+        return {}
+
+    out = {}
+    for w in windows:
+        s_ret = (s_close.iloc[-1] / s_close.iloc[-1 - w] - 1) * 100
+        b_ret = (b_close.iloc[-1] / b_close.iloc[-1 - w] - 1) * 100
+        out[f"rs{w}"] = round(float(s_ret - b_ret), 2)
+
+    rs20 = out.get("rs20", 0)
+    if rs20 >= 8:
+        out["rs_label"] = "明顯強於大盤"
+    elif rs20 >= 2:
+        out["rs_label"] = "略強於大盤"
+    elif rs20 <= -8:
+        out["rs_label"] = "明顯弱於大盤"
+    elif rs20 <= -2:
+        out["rs_label"] = "略弱於大盤"
+    else:
+        out["rs_label"] = "與大盤同步"
+    return out
+
+
+def score_stock(df: pd.DataFrame, rs: dict | None = None,
+                fundamental: dict | None = None) -> tuple[int, list[str]]:
     """
     Return (score, signals) for the most recent day.
     Higher score = stronger technical setup.
+
+    rs:          optional relative-strength dict from compute_relative_strength.
+    fundamental: optional dict with rev_yoy / rev_mom (月營收成長率, %).
     """
     if df is None or len(df) < 20:
         return 0, []
@@ -169,5 +243,66 @@ def score_stock(df: pd.DataFrame) -> tuple[int, list[str]]:
         elif vol_ratio < 0.5:
             score -= 3
             signals.append("量能萎縮")
+
+    # --- RSI (max 13pts) ---
+    rsi = val(last, "RSI")
+    if not np.isnan(rsi):
+        if rsi < 20:
+            score += 13
+            signals.append(f"RSI深度超賣({rsi:.0f})")
+        elif rsi < 30:
+            score += 8
+            signals.append(f"RSI超賣({rsi:.0f})")
+        elif rsi > 70:
+            score -= 8
+            signals.append(f"RSI超買({rsi:.0f})")
+
+    # --- Bollinger Bands (max 18pts) ---
+    bb_pct = val(last, "BB_pct")
+    bb_width = val(last, "BB_width")
+    prev_bb_width = val(prev, "BB_width")
+    close_change = val(last, "Close") - val(prev, "Close")
+
+    if not np.isnan(bb_pct):
+        if bb_pct < 0.1 and close_change > 0:
+            score += 10
+            signals.append(f"布林下軌反彈(%B={bb_pct:.2f})")
+        elif bb_pct > 0.9:
+            score -= 5
+            signals.append(f"布林上軌警戒(%B={bb_pct:.2f})")
+
+    # Bollinger squeeze breakout: width was shrinking, now expanding
+    if not any(np.isnan([bb_width, prev_bb_width])) and prev_bb_width > 0:
+        if bb_width > prev_bb_width * 1.1 and bb_pct > 0.5:
+            score += 8
+            signals.append("布林通道突破收斂")
+
+    # --- 相對強度 RS (max 12pts) ---
+    if rs:
+        rs20 = rs.get("rs20")
+        if rs20 is not None:
+            if rs20 >= 8:
+                score += 12
+                signals.append(f"20日大幅強於大盤({rs20:+.1f}%)")
+            elif rs20 >= 2:
+                score += 7
+                signals.append(f"20日強於大盤({rs20:+.1f}%)")
+            elif rs20 <= -8:
+                score -= 8
+                signals.append(f"20日明顯落後大盤({rs20:+.1f}%)")
+
+    # --- 月營收成長 (max 12pts) ---
+    if fundamental:
+        yoy = fundamental.get("rev_yoy")
+        if yoy is not None:
+            if yoy >= 30:
+                score += 12
+                signals.append(f"月營收YoY大增({yoy:+.0f}%)")
+            elif yoy >= 10:
+                score += 7
+                signals.append(f"月營收YoY成長({yoy:+.0f}%)")
+            elif yoy <= -20:
+                score -= 8
+                signals.append(f"月營收YoY衰退({yoy:+.0f}%)")
 
     return max(0, score), signals

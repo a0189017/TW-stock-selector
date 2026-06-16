@@ -31,6 +31,8 @@ async def list_tools() -> list[types.Tool]:
                 "抓取台灣股市今日選股數據。"
                 "自動執行三階段篩選（流動性 → 籌碼面 → 技術指標），"
                 "回傳最多 80 支候選股票的完整技術面與籌碼面數據，以及今日大盤概況。\n\n"
+                "支援盤中模式（intraday=true）：個股收盤價會以 yfinance 即時報價覆蓋，"
+                "反映當下盤中走勢（約 15 分鐘延遲），籌碼面仍為昨日收盤後資料。\n\n"
                 "呼叫此工具取得數據後，請以資深台股投資人（股癌）風格分析，"
                 "選出今日最值得關注的 10 檔股票，每支給出：推薦理由、技術面、籌碼面、"
                 "進場策略、停損點、短期目標價，最後加上大盤觀察。"
@@ -46,6 +48,15 @@ async def list_tools() -> list[types.Tool]:
                     "no_cache": {
                         "type": "boolean",
                         "description": "是否強制重新抓取資料（預設 false，使用當日 cache）",
+                        "default": False,
+                    },
+                    "intraday": {
+                        "type": "boolean",
+                        "description": (
+                            "盤中模式（預設 false）。"
+                            "設為 true 時，個股收盤價以 yfinance 即時報價（約 15 分鐘延遲）覆蓋，"
+                            "適合盤中使用。籌碼面資料仍為昨日收盤後資料。"
+                        ),
                         "default": False,
                     },
                 },
@@ -149,6 +160,34 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["code"],
             },
         ),
+        types.Tool(
+            name="screener_performance",
+            description=(
+                "評估選股系統過去的實際績效（誠實的命中率報告）。\n"
+                "系統每次執行 fetch_stock_candidates 都會把量化候選存檔；此工具回讀"
+                "已滿一定天數的歷史推薦，計算其在持有 N 個交易日後的未來報酬，"
+                "並依技術評分分組（高/中/低分），給出平均報酬與勝率。\n\n"
+                "可用來回答「這套選股到底準不準」、「高分股是否真的表現較好」。\n"
+                "取得數據後，請客觀解讀：哪一組勝率/報酬較高、評分是否有鑑別度、"
+                "若高分組未明顯優於低分組則提醒使用者評分權重可能需要調整。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "horizon": {
+                        "type": "integer",
+                        "description": "持有交易日數（預設 10）",
+                        "default": 10,
+                    },
+                    "min_age_days": {
+                        "type": "integer",
+                        "description": "推薦至少需滿幾天才納入評估（預設 14）",
+                        "default": 14,
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -157,6 +196,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name not in {
         "fetch_stock_candidates", "check_portfolio",
         "add_holding", "remove_holding", "list_holdings", "analyze_stock",
+        "screener_performance",
     }:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -209,24 +249,38 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         )
         return [types.TextContent(type="text", text=result_text)]
 
+    if name == "screener_performance":
+        horizon = int(arguments.get("horizon", 10))
+        min_age = int(arguments.get("min_age_days", 14))
+        result_text = await loop.run_in_executor(
+            None, lambda: _run_screener_performance(horizon, min_age)
+        )
+        return [types.TextContent(type="text", text=result_text)]
+
     # fetch_stock_candidates
     limit = min(int(arguments.get("limit", 80)), 150)
+    intraday = bool(arguments.get("intraday", False))
     result_text = await loop.run_in_executor(
-        None, lambda: _run_pipeline(limit, no_cache)
+        None, lambda: _run_pipeline(limit, no_cache, intraday)
     )
     return [types.TextContent(type="text", text=result_text)]
 
 
 def _run_health_check(no_cache: bool = False) -> str:
     """Run portfolio health check and return JSON."""
+    from data.cache import set_bypass
     try:
-        if no_cache:
-            import data.cache as dc
-            dc.cache_get = lambda key: None
-
-        from portfolio import run_health_check
-        result = run_health_check()
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        # Never write to cache during health check — avoids polluting the screener
+        # cache with a partial fetch triggered by portfolio-only requests. Bypass
+        # reads too when the caller forces a refresh. One global switch now covers
+        # every fetcher (no more per-module monkeypatching that missed some).
+        set_bypass(read=no_cache, write=True)
+        try:
+            from portfolio import run_health_check
+            result = run_health_check()
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        finally:
+            set_bypass(read=False, write=False)
     except Exception as e:
         import traceback
         return json.dumps(
@@ -235,12 +289,30 @@ def _run_health_check(no_cache: bool = False) -> str:
         )
 
 
-def _run_pipeline(limit: int = 80, no_cache: bool = False) -> str:
-    """Run the full screening pipeline and return JSON result."""
+def _run_screener_performance(horizon: int = 10, min_age_days: int = 14) -> str:
+    """Grade past screenings by forward return. Never writes cache."""
+    from data.cache import set_bypass
     try:
-        if no_cache:
-            import data.cache as dc
-            dc.cache_get = lambda key: None
+        set_bypass(read=False, write=True)
+        try:
+            from data.recommendations import evaluate_performance
+            result = evaluate_performance(horizon=horizon, min_age_days=min_age_days)
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        finally:
+            set_bypass(read=False, write=False)
+    except Exception as e:
+        import traceback
+        return json.dumps(
+            {"error": str(e), "traceback": traceback.format_exc()},
+            ensure_ascii=False,
+        )
+
+
+def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = False) -> str:
+    """Run the full screening pipeline and return JSON result."""
+    from data.cache import set_bypass
+    try:
+        set_bypass(read=no_cache, write=False)
 
         from data.fetcher_universe import fetch_universe, fetch_market_summary
         from data.fetcher_chip import fetch_chip_data, compute_market_foreign_total
@@ -289,46 +361,58 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False) -> str:
                 market_summary["taiex"] = f"{last:,.2f}"
                 market_summary["taiex_change"] = f"({sign}{chg:,.2f} / {sign}{pct:.2f}%)"
 
-        # Stage 3: Technical scoring
-        final = stage3_technical(s2, history)
+                # Futures overlay: basis + institutional positions
+                from data.fetcher_futures import fetch_futures_summary
+                futures = fetch_futures_summary(taiex_close=last)
+                if futures:
+                    market_summary["期貨概況"] = futures
+
+        # Stage 3: Technical scoring (with relative strength + monthly revenue)
+        from data.fetcher_fundamental import fetch_month_revenue
+        fundamental = fetch_month_revenue()
+        final = stage3_technical(s2, history, fundamental=fundamental)
 
         if final.empty:
             final = s2.head(limit)
 
+        # Persist the quantitative screening so screener_performance can grade it
+        try:
+            from data.recommendations import save_screening
+            save_screening(final.to_dict("records"))
+        except Exception:
+            pass
+
         # Build output
+        from analysis.common import serialize_tech, serialize_chip, serialize_fundamental
         stocks_data = []
         for _, row in final.head(limit).iterrows():
+            d = row.to_dict()
             stocks_data.append({
-                "代號": row.get("code", ""),
-                "名稱": row.get("name", ""),
-                "產業": row.get("industry", ""),
-                "交易所": row.get("exchange", ""),
-                "收盤": row.get("close", 0),
-                "漲跌%": row.get("change_pct", 0),
-                "技術評分": row.get("tech_score", 0),
-                "技術信號": row.get("tech_signals", []),
-                "技術指標": {
-                    "KD(K/D)": f"{row.get('kd_k', 50):.1f}/{row.get('kd_d', 50):.1f}",
-                    "MACD柱": f"{row.get('macd_hist', 0):.4f}",
-                    "均線乖離(MA5/MA20/MA60)": (
-                        f"{row.get('bias5', 0):+.1f}%/"
-                        f"{row.get('bias20', 0):+.1f}%/"
-                        f"{row.get('bias60', 0):+.1f}%"
-                    ),
-                    "量比": f"{row.get('vol_ratio', 1):.1f}x",
-                    "均線結構": row.get("ma_structure", "整理"),
-                    "MA20": row.get("ma20", 0),
-                    "MA60": row.get("ma60", 0),
-                },
-                "籌碼": {
-                    "外資今日淨買(張)": f"{row.get('foreign_net_today', 0):+,.0f}",
-                    "外資5日淨買(張)": f"{row.get('foreign_net_5d', 0):+,.0f}",
-                    "投信今日淨買(張)": f"{row.get('trust_net_today', 0):+,.0f}",
-                    "三大法人今日(張)": f"{row.get('big3_net_today', 0):+,.0f}",
-                    "融資餘額變化": f"{row.get('margin_change_pct', 0):+.1f}%",
-                    "融資使用率": f"{row.get('margin_util_rate', 0):.1f}%",
-                },
+                "代號": d.get("code", ""),
+                "名稱": d.get("name", ""),
+                "產業": d.get("industry", ""),
+                "交易所": d.get("exchange", ""),
+                "收盤": d.get("close", 0),
+                "漲跌%": d.get("change_pct", 0),
+                "技術評分": d.get("tech_score", 0),
+                "技術信號": d.get("tech_signals", []),
+                "技術指標": serialize_tech(d),
+                "籌碼": serialize_chip(d),
+                "基本面": serialize_fundamental(d),
             })
+
+        # ---- Intraday: patch close price + change% with yfinance realtime quotes ----
+        if intraday and stocks_data:
+            from data.fetcher_realtime import fetch_realtime_quotes
+            rt_candidates = [{"code": s["代號"], "exchange": s["交易所"]} for s in stocks_data]
+            rt_quotes = fetch_realtime_quotes(rt_candidates)
+            rt_count = 0
+            for s in stocks_data:
+                qt = rt_quotes.get(s["代號"])
+                if qt:
+                    s["收盤"] = qt["close"]
+                    s["漲跌%"] = qt["change_pct"]
+                    rt_count += 1
 
         from datetime import datetime
         from data.cache import cache_get, make_key as _make_key
@@ -341,7 +425,12 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False) -> str:
         # Format for display: YYYYMMDD → YYYY-MM-DD
         data_date = f"{actual_data_date[:4]}-{actual_data_date[4:6]}-{actual_data_date[6:]}" if len(actual_data_date) == 8 else datetime.today().strftime("%Y-%m-%d")
         is_today = (actual_data_date == today_str)
-        data_note = "今日收盤資料" if is_today else f"最近交易日資料（使用 {data_date} 收盤價，盤中或資料尚未更新）"
+        if intraday:
+            data_note = f"盤中即時模式（個股報價來自 yfinance，約 15 分鐘延遲；籌碼面為 {data_date} 收盤後資料）"
+        elif is_today:
+            data_note = "今日收盤資料"
+        else:
+            data_note = f"最近交易日資料（使用 {data_date} 收盤價，盤中或資料尚未更新）"
 
         output = {
             "資料日期": data_date,
@@ -365,16 +454,20 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False) -> str:
             "error": str(e),
             "traceback": traceback.format_exc()
         }, ensure_ascii=False)
+    finally:
+        set_bypass(read=False, write=False)
 
 
 def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
     """Fetch full technical + chip data for a single stock and return JSON."""
+    from data.cache import set_bypass
     try:
         import pandas as pd
         from data.fetcher_universe import fetch_universe
         from data.fetcher_chip import fetch_chip_data
         from data.fetcher_history import fetch_history
-        from analysis.indicators import add_all_indicators, score_stock
+        from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
+        from analysis.common import extract_indicators, serialize_tech, serialize_chip, serialize_fundamental
         from config import get_recent_weekdays
 
         if not (code.isdigit() and len(code) == 4):
@@ -383,9 +476,7 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
                 ensure_ascii=False,
             )
 
-        if no_cache:
-            import data.cache as dc
-            dc.cache_get = lambda key: None
+        set_bypass(read=no_cache, write=False)
 
         # ---- Step 1: Look up basic info from today's universe ----
         universe_df = fetch_universe()
@@ -404,7 +495,7 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
         history: dict = {}
         if exchange:
             candidates = [{"code": code, "exchange": exchange}]
-            history = fetch_history(candidates, bypass_cache=no_cache, include_taiex=False)
+            history = fetch_history(candidates, bypass_cache=no_cache, include_taiex=True)
         else:
             # Try TWSE first, then TPEX
             for exch in ("TWSE", "TPEX"):
@@ -434,26 +525,19 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
 
         # ---- Step 3: Technical indicators ----
         df_ind = add_all_indicators(df_hist)
-        tech_score, tech_signals = score_stock(df_ind)
+        rs = compute_relative_strength(df_hist, history.get("^TWII"))
 
-        last = df_ind.iloc[-1]
+        # ---- Step 4: Fundamentals (monthly revenue) ----
+        from data.fetcher_fundamental import fetch_month_revenue
+        fund = fetch_month_revenue().get(code, {})
 
-        def v(col, default=0.0):
-            val = last.get(col, default)
-            return float(val) if pd.notna(val) else default
+        tech_score, tech_signals = score_stock(df_ind, rs=rs, fundamental=fund)
 
-        close_price = v("Close")
-        ma5, ma10, ma20, ma60 = v("MA5"), v("MA10"), v("MA20"), v("MA60")
-        if ma5 > ma10 > ma20 > ma60 > 0:
-            ma_structure = "多頭排列"
-        elif ma5 > ma20 > 0:
-            ma_structure = "短多"
-        elif ma5 < ma20 and ma20 > 0:
-            ma_structure = "空頭偏弱"
-        else:
-            ma_structure = "整理"
+        ind = extract_indicators(df_ind)
+        ind["rs_label"] = rs.get("rs_label", "—")
+        close_price = ind.get("yf_close", 0)
 
-        # ---- Step 4: Chip data ----
+        # ---- Step 5: Chip data ----
         dates = get_recent_weekdays(7)[:5]
         chip_df = fetch_chip_data(dates)
         chip_row: dict = {}
@@ -462,7 +546,7 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
             if not matched.empty:
                 chip_row = matched.iloc[0].to_dict()
 
-        # ---- Step 5: Recent candles ----
+        # ---- Step 6: Recent candles ----
         recent_candles = []
         for date, row in df_hist.tail(10).iterrows():
             vol_shares = float(row.get("Volume", 0))
@@ -489,31 +573,9 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
             "殖利率%": info.get("div_yield", 0),
             "技術評分": tech_score,
             "技術信號": tech_signals,
-            "技術指標": {
-                "KD(K/D)": f"{v('K'):.1f}/{v('D'):.1f}",
-                "MACD柱": f"{v('MACD_hist'):.4f}",
-                "均線乖離(MA5/MA20/MA60)": (
-                    f"{v('Bias5'):+.1f}%/"
-                    f"{v('Bias20'):+.1f}%/"
-                    f"{v('Bias60'):+.1f}%"
-                ),
-                "量比": f"{v('VolRatio'):.1f}x",
-                "均線結構": ma_structure,
-                "MA5": round(ma5, 2),
-                "MA10": round(ma10, 2),
-                "MA20": round(ma20, 2),
-                "MA60": round(ma60, 2),
-                "MA120": round(v("MA120"), 2),
-                "MA240": round(v("MA240"), 2),
-            },
-            "籌碼": {
-                "外資今日淨買(張)": f"{chip_row.get('foreign_net_today', 0):+,.0f}",
-                "外資5日淨買(張)": f"{chip_row.get('foreign_net_5d', 0):+,.0f}",
-                "投信今日淨買(張)": f"{chip_row.get('trust_net_today', 0):+,.0f}",
-                "三大法人今日(張)": f"{chip_row.get('big3_net_today', 0):+,.0f}",
-                "融資餘額變化": f"{chip_row.get('margin_change_pct', 0):+.1f}%",
-                "融資使用率": f"{chip_row.get('margin_util_rate', 0):.1f}%",
-            },
+            "技術指標": serialize_tech(ind, full=True),
+            "籌碼": serialize_chip(chip_row),
+            "基本面": serialize_fundamental(fund),
             "近10日K線": recent_candles,
         }
 
@@ -525,6 +587,8 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
             {"error": str(e), "traceback": traceback.format_exc()},
             ensure_ascii=False,
         )
+    finally:
+        set_bypass(read=False, write=False)
 
 
 async def main():

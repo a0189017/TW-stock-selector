@@ -1,9 +1,10 @@
 """3-stage screening funnel: ~2,000 stocks → 80 Claude candidates."""
 import pandas as pd
-import numpy as np
+
 from config import (VOLUME_MIN_VALUE_TWD, PRICE_MIN, PRICE_MAX,
                     CHIP_SIGNAL_MIN, STAGE3_MIN_SCORE, STAGE3_TOP_N)
-from analysis.indicators import add_all_indicators, score_stock
+from analysis.common import exclude_etfs, extract_indicators
+from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
 
 
 # ---------------------------------------------------------------------------
@@ -18,13 +19,8 @@ def stage1_liquidity(universe_df: pd.DataFrame,
     """
     df = universe_df.copy()
 
-    # Numeric code, 4 digits
-    df = df[df["code"].str.match(r"^\d{4}$")]
-
-    # Exclude ETFs (codes 00xx, or names containing ETF/基金)
-    is_etf = (df["code"].str.startswith("00") |
-              df["name"].str.contains("ETF|指數|基金|債券|REITs|REIT|期信", na=False, regex=True))
-    df = df[~is_etf]
+    # Drop ETFs / funds, keep 4-digit ordinary codes
+    df = exclude_etfs(df)
 
     # Price range
     df = df[(df["close"] >= PRICE_MIN) & (df["close"] <= PRICE_MAX)]
@@ -55,9 +51,14 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
 
     # Attach chip data
     df = stage1_df.copy()
-    for col in ("foreign_net_today", "trust_net_today", "big3_net_today",
-                "foreign_net_5d", "trust_net_5d",
-                "margin_today", "margin_prev", "margin_change_pct", "margin_util_rate"):
+    chip_cols = (
+        "foreign_net_today", "trust_net_today", "big3_net_today",
+        "foreign_net_5d", "trust_net_5d",
+        "margin_today", "margin_prev", "margin_change_pct", "margin_util_rate",
+        "short_today", "short_change_pct", "short_margin_ratio",
+        "foreign_consec_buy", "foreign_consec_sell",
+    )
+    for col in chip_cols:
         df[col] = df["code"].map(chip[col] if col in chip.columns else {}).fillna(0)
 
     def chip_signals(row) -> int:
@@ -68,10 +69,14 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
             signals += 1
         if row.get("big3_net_today", 0) > 0:
             signals += 1
-        if row.get("margin_change_pct", 0) < 0:  # margin declining = bullish
+        if row.get("margin_change_pct", 0) < 0:       # 融資下降 = 籌碼健康
             signals += 1
         if row.get("foreign_net_5d", 0) > 0:
             signals += 1
+        if row.get("foreign_consec_buy", 0) >= 3:      # 外資連續3日買超 = 強信號
+            signals += 1
+        if row.get("short_change_pct", 0) > 5:         # 融券大增 = 空方壓力
+            signals -= 1
         return signals
 
     df["chip_signals"] = df.apply(chip_signals, axis=1)
@@ -84,11 +89,16 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def stage3_technical(stage2_df: pd.DataFrame,
-                     history: dict[str, pd.DataFrame]) -> pd.DataFrame:
+                     history: dict[str, pd.DataFrame],
+                     fundamental: dict[str, dict] | None = None) -> pd.DataFrame:
     """
-    Score each candidate on technical indicators.
+    Score each candidate on technical indicators (+ relative strength vs TAIEX
+    and monthly-revenue growth when available).
     Returns top STAGE3_TOP_N stocks with score >= STAGE3_MIN_SCORE.
     """
+    fundamental = fundamental or {}
+    bench_df = history.get("^TWII")
+
     rows = []
     for _, stock in stage2_df.iterrows():
         code = stock["code"]
@@ -101,45 +111,38 @@ def stage3_technical(stage2_df: pd.DataFrame,
             continue
 
         df_ind = add_all_indicators(df_hist)
-        tech_score, tech_signals = score_stock(df_ind)
+        rs = compute_relative_strength(df_hist, bench_df)
+        fund = fundamental.get(code, {})
+        tech_score, tech_signals = score_stock(df_ind, rs=rs, fundamental=fund)
 
         if tech_score < STAGE3_MIN_SCORE:
             continue
 
-        last = df_ind.iloc[-1]
-        prev = df_ind.iloc[-2] if len(df_ind) > 1 else last
+        ind = extract_indicators(df_ind)
 
-        def v(col, default=0.0):
-            val = last.get(col, default)
-            return float(val) if pd.notna(val) else default
-
-        # Build MA structure label
-        close = v("Close")
-        ma5, ma10, ma20, ma60 = v("MA5"), v("MA10"), v("MA20"), v("MA60")
-        if ma5 > ma10 > ma20 > ma60 > 0:
-            ma_structure = "多頭排列"
-        elif ma5 > ma20 > 0:
-            ma_structure = "短多"
-        elif ma5 < ma20 < 0:
-            ma_structure = "空頭排列"
-        else:
-            ma_structure = "整理"
+        # Price-source reconciliation: universe close is the official close;
+        # yfinance close drives the indicators. Flag large divergences so the
+        # analyst knows the technical readout may be on a different print.
+        official_close = float(stock.get("close", 0) or 0)
+        yf_close = ind.get("yf_close", 0)
+        if official_close > 0 and yf_close > 0:
+            diff_pct = abs(yf_close - official_close) / official_close * 100
+            if diff_pct > 2:
+                tech_signals = list(tech_signals) + [
+                    f"⚠官方收盤{official_close}與yfinance{yf_close}背離{diff_pct:.1f}%"]
 
         row = stock.to_dict()
+        row.update(ind)
         row.update({
             "tech_score": tech_score,
             "tech_signals": tech_signals,
-            "kd_k": round(v("K"), 1),
-            "kd_d": round(v("D"), 1),
-            "macd_hist": round(v("MACD_hist"), 4),
-            "bias5": round(v("Bias5"), 2) if not pd.isna(v("Bias5")) else 0.0,
-            "bias20": round(v("Bias20"), 2) if not pd.isna(v("Bias20")) else 0.0,
-            "bias60": round(v("Bias60"), 2) if not pd.isna(v("Bias60")) else 0.0,
-            "vol_ratio": round(v("VolRatio"), 2),
-            "ma5": round(ma5, 2),
-            "ma20": round(ma20, 2),
-            "ma60": round(ma60, 2),
-            "ma_structure": ma_structure,
+            "rs20": rs.get("rs20"),
+            "rs60": rs.get("rs60"),
+            "rs_label": rs.get("rs_label", "—"),
+            "revenue_b": fund.get("revenue_b"),
+            "rev_yoy": fund.get("rev_yoy"),
+            "rev_mom": fund.get("rev_mom"),
+            "rev_month": fund.get("rev_month"),
         })
         rows.append(row)
 

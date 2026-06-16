@@ -4,6 +4,9 @@ import requests
 import pandas as pd
 from data.cache import cache_get, cache_set, make_key
 from config import TWSE_RWD, TWSE_OPENAPI, TPEX_OPENAPI, REQUEST_TIMEOUT, REQUEST_DELAY, clean_number, get_recent_weekdays
+from log import get_logger
+
+logger = get_logger()
 
 
 def _get(url: str, params: dict = None) -> dict | list | None:
@@ -14,7 +17,8 @@ def _get(url: str, params: dict = None) -> dict | list | None:
                          headers={"User-Agent": "Mozilla/5.0"}, verify=False)
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except Exception as e:
+        logger.warning("chip fetch failed (%s): %s", url, e)
         return None
 
 
@@ -101,7 +105,8 @@ def fetch_twse_institutional(dates: list[str]) -> pd.DataFrame:
     combined = pd.concat(all_dfs, ignore_index=True)
 
     # Today's net + 5-day accumulated
-    latest_date = max(d["date"] for d in [{"date": row} for row in combined["date"].unique()])
+    dates_sorted = sorted(combined["date"].unique())
+    latest_date = dates_sorted[-1]
     today_df = combined[combined["date"] == latest_date].set_index("code")
 
     agg = (combined.groupby("code")[["foreign_net", "trust_net", "big3_net"]]
@@ -119,6 +124,37 @@ def fetch_twse_institutional(dates: list[str]) -> pd.DataFrame:
     })
 
     result = agg.join(today_df, how="left").reset_index()
+
+    # --- 外資連續買超/賣超天數 ---
+    # For each stock, count consecutive buy/sell days from the most recent date backwards.
+    consec_buy = {}
+    consec_sell = {}
+    for code, grp in combined.groupby("code"):
+        grp_sorted = grp.sort_values("date", ascending=False)
+        buy_streak = sell_streak = 0
+        for net in grp_sorted["foreign_net"]:
+            if net > 0:
+                if buy_streak == 0 and sell_streak == 0:
+                    buy_streak += 1
+                elif buy_streak > 0:
+                    buy_streak += 1
+                else:
+                    break
+            elif net < 0:
+                if sell_streak == 0 and buy_streak == 0:
+                    sell_streak += 1
+                elif sell_streak > 0:
+                    sell_streak += 1
+                else:
+                    break
+            else:
+                break
+        consec_buy[code] = buy_streak
+        consec_sell[code] = sell_streak
+
+    result["foreign_consec_buy"] = result["code"].map(consec_buy).fillna(0).astype(int)
+    result["foreign_consec_sell"] = result["code"].map(consec_sell).fillna(0).astype(int)
+
     return result
 
 
@@ -146,6 +182,7 @@ def fetch_twse_margin() -> pd.DataFrame:
         if not (code.isdigit() and len(code) == 4):
             continue
 
+        # 融資
         today_bal = clean_number(
             item.get("MarginPurchaseTodayBalance") or item.get("融資今日餘額", 0))
         prev_bal = clean_number(
@@ -158,12 +195,26 @@ def fetch_twse_margin() -> pd.DataFrame:
             change_pct = 0.0
         util_rate = (today_bal / limit * 100) if limit > 0 else 0.0
 
+        # 融券
+        short_today = clean_number(
+            item.get("ShortSellingTodayBalance") or item.get("融券今日餘額", 0))
+        short_prev = clean_number(
+            item.get("ShortSellingYesterdayBalance") or item.get("融券前日餘額", 0))
+        short_change_pct = ((short_today - short_prev) / short_prev * 100
+                            if short_prev > 0 else 0.0)
+        # 券資比：融券餘額 / 融資餘額（張數）
+        short_margin_ratio = (short_today / today_bal * 100) if today_bal > 0 else 0.0
+
         rows.append({
             "code": code,
             "margin_today": today_bal,
             "margin_prev": prev_bal,
             "margin_change_pct": round(change_pct, 2),
             "margin_util_rate": round(util_rate, 2),
+            "short_today": short_today,
+            "short_prev": short_prev,
+            "short_change_pct": round(short_change_pct, 2),
+            "short_margin_ratio": round(short_margin_ratio, 2),
         })
 
     df = pd.DataFrame(rows)

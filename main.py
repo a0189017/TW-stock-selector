@@ -17,11 +17,9 @@ from output.report_writer import save_report
 
 
 def patch_cache_if_no_cache(no_cache: bool):
-    """If --no-cache, override cache_get to always return None."""
-    if not no_cache:
-        return
-    import data.cache as dc
-    dc.cache_get = lambda key: None
+    """If --no-cache, make every cache read miss (fetch fresh)."""
+    from data.cache import set_bypass
+    set_bypass(read=no_cache)
 
 
 def get_taiex_info(history: dict) -> tuple[str, str]:
@@ -48,6 +46,9 @@ def main():
     args = parser.parse_args()
 
     patch_cache_if_no_cache(args.no_cache)
+    if args.debug:
+        from log import enable_debug
+        enable_debug()
 
     print_header()
     start_time = time.time()
@@ -121,9 +122,11 @@ def main():
         # ----------------------------------------------------------------
         # Stage 3: Technical scoring
         # ----------------------------------------------------------------
-        progress.update(task, description="Phase 4/5  技術指標評分...")
+        progress.update(task, description="Phase 4/5  技術指標評分（含相對強度 + 月營收）...")
         from analysis.screener import stage3_technical
-        final_candidates = stage3_technical(s2_df, history)
+        from data.fetcher_fundamental import fetch_month_revenue
+        fundamental = fetch_month_revenue()
+        final_candidates = stage3_technical(s2_df, history, fundamental=fundamental)
 
         if args.debug:
             print_stage_summary(3, "技術指標篩選", len(final_candidates), len(s2_df))
@@ -131,6 +134,13 @@ def main():
         if final_candidates.empty:
             console.print("[yellow]警告：技術篩選後無候選股票，使用 Stage 2 結果（無指標分數）[/yellow]")
             final_candidates = s2_df.head(80)
+
+        # Persist the quantitative screening so it can be graded later
+        try:
+            from data.recommendations import save_screening
+            save_screening(final_candidates.to_dict("records"))
+        except Exception:
+            pass
 
         progress.update(task, description=f"Phase 4/5  技術評分 ✓  {len(final_candidates)} 支進入 Claude 分析")
 

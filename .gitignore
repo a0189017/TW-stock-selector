@@ -26,6 +26,9 @@ reports/
 # Personal portfolio data
 portfolio.json
 
+# Screening history (local SQLite, used by screener_performance / backtest)
+recommendations.db
+
 # Local config (contains absolute paths)
 claude_desktop_config_snippet.json
 

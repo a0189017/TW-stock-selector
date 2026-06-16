@@ -180,10 +180,12 @@ def run_health_check() -> dict:
         for c in codes
     ]
     from data.fetcher_history import fetch_history
-    from analysis.indicators import add_all_indicators, score_stock
-    # Always bypass cache for health checks: holdings may not be in screener cache,
-    # and we want the most current price data for risk assessment.
-    history = fetch_history(candidates, bypass_cache=True, include_taiex=False)
+    from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
+    from analysis.common import extract_indicators, serialize_chip
+    # Always bypass cache for history reads here: holdings may not be in the
+    # screener cache, and we want the most current prices for risk assessment.
+    history = fetch_history(candidates, bypass_cache=True, include_taiex=True)
+    bench_df = history.get("^TWII")
 
     tech_map = {}
     for code in codes:
@@ -194,34 +196,14 @@ def run_health_check() -> dict:
         if df_h is None or len(df_h) < 20:
             continue
         df_ind = add_all_indicators(df_h)
-        t_score, t_signals = score_stock(df_ind)
-        last = df_ind.iloc[-1]
+        rs = compute_relative_strength(df_h, bench_df)
+        t_score, t_signals = score_stock(df_ind, rs=rs)
 
-        def v(col, default=0.0):
-            import numpy as np
-            val = last.get(col, default)
-            return float(val) if pd.notna(val) else default
-
-        tech_map[code] = {
-            "tech_score": t_score,
-            "tech_signals": t_signals,
-            "kd_k": round(v("K"), 1),
-            "kd_d": round(v("D"), 1),
-            "macd_hist": round(v("MACD_hist"), 4),
-            "bias20": round(v("Bias20"), 2),
-            "bias60": round(v("Bias60"), 2),
-            "vol_ratio": round(v("VolRatio"), 2),
-            "ma5": round(v("MA5"), 2),
-            "ma20": round(v("MA20"), 2),
-            "ma60": round(v("MA60"), 2),
-            "ma240": round(v("MA240"), 2),
-            "ma_structure": (
-                "多頭排列" if v("MA5") > v("MA10") > v("MA20") > v("MA60") > 0
-                else "短多" if v("MA5") > v("MA20") > 0
-                else "空頭排列" if v("MA5") < v("MA20") < v("MA60")
-                else "整理"
-            ),
-        }
+        ind = extract_indicators(df_ind)
+        ind["tech_score"] = t_score
+        ind["tech_signals"] = t_signals
+        ind["rs_label"] = rs.get("rs_label", "—")
+        tech_map[code] = ind
 
     # ---- Assemble results ----
     from datetime import datetime
@@ -281,8 +263,11 @@ def run_health_check() -> dict:
                 "技術評分": tech.get("tech_score", "—"),
                 "技術信號": tech.get("tech_signals", []),
                 "KD(K/D)": f"{tech.get('kd_k', 0):.1f}/{tech.get('kd_d', 0):.1f}",
+                "RSI": f"{tech.get('rsi', 50):.1f}",
+                "布林%B": f"{tech.get('bb_pct', 0.5):.2f}",
                 "MACD柱": tech.get("macd_hist", 0),
                 "均線結構": tech.get("ma_structure", "—"),
+                "相對大盤強度": tech.get("rs_label", "—"),
                 "20MA乖離": f"{tech.get('bias20', 0):+.1f}%",
                 "60MA乖離": f"{tech.get('bias60', 0):+.1f}%",
                 "量比": f"{tech.get('vol_ratio', 0):.1f}x",
@@ -290,14 +275,7 @@ def run_health_check() -> dict:
                 "MA60": ma60,
                 "MA240": tech.get("ma240", 0),
             },
-            "籌碼面": {
-                "外資今日淨買(張)": f"{chip.get('foreign_net_today', 0):+,.0f}",
-                "外資5日淨買(張)": f"{chip.get('foreign_net_5d', 0):+,.0f}",
-                "投信今日淨買(張)": f"{chip.get('trust_net_today', 0):+,.0f}",
-                "三大法人今日(張)": f"{chip.get('big3_net_today', 0):+,.0f}",
-                "融資餘額變化": f"{chip.get('margin_change_pct', 0):+.1f}%",
-                "融資使用率": f"{chip.get('margin_util_rate', 0):.1f}%",
-            },
+            "籌碼面": serialize_chip(chip),
             "預判建議": pre_rec,
             "風險提示": risk_signals,
             "停損參考價": round(stop_ref, 1),

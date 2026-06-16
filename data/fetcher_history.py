@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 from data.cache import cache_get, cache_set, make_key
 from datetime import datetime
+from log import get_logger
+
+logger = get_logger()
 
 MIN_TRADING_DAYS = 60
 
@@ -81,17 +84,22 @@ def fetch_history(
         return result
 
     # Batch download missing tickers
-    raw = yf.download(
-        tickers=missing_tickers,
-        period="1y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-        group_by="ticker",
-    )
+    try:
+        raw = yf.download(
+            tickers=missing_tickers,
+            period="1y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+            group_by="ticker",
+        )
+    except Exception as e:
+        logger.warning("yfinance download failed for %d tickers: %s", len(missing_tickers), e)
+        return result
 
     if raw.empty:
+        logger.warning("yfinance returned empty for %d tickers", len(missing_tickers))
         return result
 
     # Unified extraction: always use MultiIndex path since yfinance 1.x always
@@ -119,7 +127,8 @@ def fetch_history(
                 if not bypass_cache:
                     key = make_key("hist1y", ticker, today)
                     cache_set(key, _serialize_df(df))
-        except Exception:
+        except Exception as e:
+            logger.debug("parse failed for %s: %s", ticker, e)
             continue
 
     return result

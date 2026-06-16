@@ -1,6 +1,8 @@
 """Compute today's hot sectors and hot individual stocks from full universe data."""
 import pandas as pd
 
+from analysis.common import exclude_etfs
+
 
 def compute_hot_sectors(universe_df: pd.DataFrame,
                         chip_df: pd.DataFrame,
@@ -12,11 +14,7 @@ def compute_hot_sectors(universe_df: pd.DataFrame,
     if universe_df.empty or "industry" not in universe_df.columns:
         return []
 
-    df = universe_df.copy()
-    # Exclude ETFs / funds
-    is_etf = (df["code"].str.startswith("00") |
-              df["name"].str.contains("ETF|指數|基金|債券|REITs|REIT|期信", na=False, regex=True))
-    df = df[~is_etf & df["code"].str.match(r"^\d{4}$")]
+    df = exclude_etfs(universe_df.copy())
     df = df[df["industry"].str.strip() != ""]
     df = df[df["industry"] != "其他"]
 
@@ -83,10 +81,7 @@ def compute_hot_stocks(universe_df: pd.DataFrame,
     if universe_df.empty:
         return []
 
-    df = universe_df.copy()
-    is_etf = (df["code"].str.startswith("00") |
-              df["name"].str.contains("ETF|指數|基金|債券|REITs|REIT|期信", na=False, regex=True))
-    df = df[~is_etf & df["code"].str.match(r"^\d{4}$")]
+    df = exclude_etfs(universe_df.copy())
     df = df[(df["close"] >= 10) & (df["close"] <= 2000)]
     df = df[df["trade_value"] >= 5e7]  # 5,000萬以上成交額才算流動性夠
 

@@ -19,12 +19,16 @@
      ▼ Stage 2：籌碼信號篩選
      │  外資 / 投信淨買、融資變化，至少 2 個正向籌碼信號
      │
-     ▼ Stage 3：技術指標評分
-     │  KD、MACD、均線結構、乖離率、量比，取前 80 名
+     ▼ Stage 3：技術 + 強度 + 基本面評分
+     │  KD、MACD、均線結構、乖離率、量比、布林、RSI
+     │  ＋ 相對大盤強度（RS）＋ 月營收 YoY/MoM，取前 80 名
      │
      ▼ Claude AI 分析
         選出 10 檔，給出推薦理由、進場策略、停損點、目標價
 ```
+
+> 評分權重可用 `python backtest.py` 以歷史 K 線回測驗證；每日量化候選會存檔，
+> 之後可用 `screener_performance` 工具檢視實際命中率與報酬。
 
 ---
 
@@ -55,17 +59,27 @@ ANTHROPIC_API_KEY=sk-ant-...
 ### CLI 模式
 
 ```bash
-# 正常執行（使用 6 小時 cache）
+# 正常執行（使用 1 小時 cache）
 python main.py
 
 # 強制重新抓取所有資料
 python main.py --no-cache
 
-# 顯示中間篩選結果
+# 顯示中間篩選結果 + 詳細 log
 python main.py --debug
 ```
 
 報告會存到 `reports/` 目錄（`.gitignore` 已排除）。
+
+### 回測與測試
+
+```bash
+# 回測技術評分：驗證高分組是否真的有較好的未來報酬
+python backtest.py --stocks 120 --horizon 10
+
+# 執行單元測試
+pytest
+```
 
 ### MCP Server 模式（Claude Desktop）
 
@@ -100,6 +114,7 @@ python main.py --debug
 | `add_holding` | 新增持股（代號、張數、成本價） |
 | `remove_holding` | 移除持股 |
 | `list_holdings` | 列出目前持股清單 |
+| `screener_performance` | 評估過去選股的實際績效（依技術評分分組的未來報酬與勝率） |
 
 **範例對話：**
 > 「幫我跑今天的選股，選出最值得進場的 10 檔」
@@ -115,8 +130,11 @@ python main.py --debug
 | 股票清單、今日行情 | TWSE OpenAPI、TPEX OpenAPI |
 | 三大法人、融資融券 | TWSE RWD API |
 | 歷史 K 線（OHLCV） | Yahoo Finance（yfinance） |
+| 月營收（YoY/MoM） | FinMind（免費，免 token） |
+| 台指期價差、三大法人留倉 | TAIFEX OpenAPI |
 
-資料有 6 小時 cache（SQLite），避免頻繁打 API。
+資料有 cache（diskcache，預設 TTL 1 小時；全市場行情採 45 分／5 分自適應），避免頻繁打 API。
+持股健檢與績效評估執行時不寫入 cache，避免污染選股快取。
 
 ---
 
@@ -125,23 +143,31 @@ python main.py --debug
 ```
 ├── main.py              # CLI 入口
 ├── mcp_server.py        # MCP Server 入口
+├── backtest.py          # 技術評分回測
 ├── config.py            # 參數設定（篩選門檻、Cache TTL 等）
-├── portfolio.py         # 持股管理（CRUD）
+├── portfolio.py         # 持股管理（CRUD）+ 健檢
+├── log.py               # 共用 logger
 ├── data/
-│   ├── fetcher_universe.py   # 抓取全市場股票清單
-│   ├── fetcher_chip.py       # 抓取籌碼資料
-│   ├── fetcher_history.py    # 抓取歷史 K 線
-│   └── cache.py              # SQLite cache 封裝
+│   ├── fetcher_universe.py    # 抓取全市場股票清單
+│   ├── fetcher_chip.py        # 抓取籌碼資料（三大法人 / 融資融券）
+│   ├── fetcher_history.py     # 抓取歷史 K 線
+│   ├── fetcher_fundamental.py # 抓取月營收（FinMind）
+│   ├── fetcher_futures.py     # 抓取台指期（TAIFEX）
+│   ├── fetcher_realtime.py    # 盤中即時報價（yfinance）
+│   ├── recommendations.py     # 推薦歷史留存 + 績效評估（SQLite）
+│   └── cache.py               # diskcache 封裝（全域 bypass 開關）
 ├── analysis/
-│   ├── screener.py           # 三階段篩選邏輯
-│   ├── indicators.py         # 技術指標計算（KD / MACD / 均線 / 量比）
-│   └── market_hot.py         # 強勢族群 / 強勢個股計算
+│   ├── screener.py            # 三階段篩選邏輯
+│   ├── indicators.py          # 技術指標 + 相對強度 + 評分
+│   ├── common.py              # 共用工具（ETF 排除 / 序列化 / 均線結構）
+│   └── market_hot.py          # 強勢族群 / 強勢個股計算
 ├── ai/
-│   ├── claude_client.py      # Anthropic API 呼叫（streaming）
-│   └── prompt_builder.py     # 系統提示詞 + 用戶提示詞建構
-└── output/
-    ├── renderer.py           # Rich 終端輸出
-    └── report_writer.py      # Markdown 報告存檔
+│   ├── claude_client.py       # Anthropic API 呼叫（streaming）
+│   └── prompt_builder.py      # 系統提示詞 + 用戶提示詞建構
+├── output/
+│   ├── renderer.py            # Rich 終端輸出
+│   └── report_writer.py       # Markdown 報告存檔
+└── tests/                     # pytest 單元測試（indicators / common）
 ```
 
 ---

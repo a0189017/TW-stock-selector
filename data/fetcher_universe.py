@@ -11,6 +11,9 @@ import pandas as pd
 from datetime import datetime
 from data.cache import cache_get, cache_set, make_key
 from config import TWSE_OPENAPI, TWSE_RWD, TPEX_OPENAPI, FINMIND_API, REQUEST_TIMEOUT, CACHE_TTL_SECONDS, clean_number, get_recent_weekdays
+from log import get_logger
+
+logger = get_logger()
 
 # How many stocks minimum before we consider the data "valid"
 _MIN_STOCKS = 200
@@ -29,9 +32,11 @@ def _fetch_json(url: str, params: dict = None, retries: int = 2) -> list | dict 
                              headers={"User-Agent": "Mozilla/5.0"}, verify=False)
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
             if attempt < retries - 1:
                 time.sleep(1)
+            else:
+                logger.warning("universe fetch failed (%s): %s", url, e)
     return None
 
 
