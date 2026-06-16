@@ -51,54 +51,111 @@ def _pick_codes(n: int) -> list[tuple[str, str]]:
     return list(zip(df["code"], df["exchange"]))
 
 
-def backtest(code_exchanges: list[tuple[str, str]], horizon: int, step: int,
+def _bucket(score: int) -> str:
+    if score >= 55:
+        return "高分(≥55)"
+    if score >= 45:
+        return "中分(45-54)"
+    if score >= 35:
+        return "低分(<45)"
+    return "未達門檻(<35)"
+
+
+_BUCKET_NAMES = ["高分(≥55)", "中分(45-54)", "低分(<45)", "未達門檻(<35)"]
+
+
+def backtest(code_exchanges: list[tuple[str, str]], horizons: list[int], step: int,
              period: str) -> dict:
+    """
+    Returns {horizon: result_dict}. History is downloaded once and each (stock, day)
+    is scored once; every horizon reuses that score, so comparing horizons is cheap.
+    """
     tickers = [f"{c}{'.TW' if e == 'TWSE' else '.TWO'}" for c, e in code_exchanges]
     logger.info("backtest: downloading %d tickers (%s)", len(tickers), period)
     history = _download(tickers, period)
+    max_h = max(horizons)
 
-    buckets = {"高分(≥55)": [], "中分(45-54)": [], "低分(<45)": [], "未達門檻(<35)": []}
-    samples = 0
+    # buckets[horizon][bucket_name] -> list of forward returns
+    buckets = {h: {name: [] for name in _BUCKET_NAMES} for h in horizons}
+    samples = {h: 0 for h in horizons}
 
     for ticker, df in history.items():
         df_ind = add_all_indicators(df)
         closes = df_ind["Close"].values
         n = len(df_ind)
-        # need >=60 bars of history before scoring, and horizon bars after
-        for i in range(60, n - horizon, step):
-            window = df_ind.iloc[:i + 1]
-            score, _ = score_stock(window)          # pure technical, no RS/fundamental
-            base, future = closes[i], closes[i + horizon]
-            if base <= 0 or np.isnan(base) or np.isnan(future):
+        # need >=60 bars of history before scoring, and max_h bars after
+        for i in range(60, n - max_h, step):
+            score, _ = score_stock(df_ind.iloc[:i + 1])  # pure technical, scored once
+            name = _bucket(score)
+            base = closes[i]
+            if base <= 0 or np.isnan(base):
                 continue
-            fwd = (future - base) / base * 100
-            if score >= 55:
-                buckets["高分(≥55)"].append(fwd)
-            elif score >= 45:
-                buckets["中分(45-54)"].append(fwd)
-            elif score >= 35:
-                buckets["低分(<45)"].append(fwd)
-            else:
-                buckets["未達門檻(<35)"].append(fwd)
-            samples += 1
+            for h in horizons:
+                future = closes[i + h]
+                if np.isnan(future):
+                    continue
+                buckets[h][name].append((future - base) / base * 100)
+                samples[h] += 1
 
-    result = {
-        "設定": {"股票數": len(history), "持有交易日": horizon,
-                "取樣間隔": step, "歷史長度": period, "總樣本": samples},
-        "分組結果": {},
-    }
-    for name, rets in buckets.items():
-        if not rets:
-            result["分組結果"][name] = {"樣本數": 0}
-            continue
-        arr = np.array(rets)
-        result["分組結果"][name] = {
-            "樣本數": len(arr),
-            "平均報酬%": round(float(arr.mean()), 2),
-            "中位數%": round(float(np.median(arr)), 2),
-            "勝率%": round(float((arr > 0).mean() * 100), 1),
+    results = {}
+    for h in horizons:
+        groups = {}
+        for name in _BUCKET_NAMES:
+            rets = buckets[h][name]
+            if not rets:
+                groups[name] = {"樣本數": 0}
+                continue
+            arr = np.array(rets)
+            groups[name] = {
+                "樣本數": len(arr),
+                "平均報酬%": round(float(arr.mean()), 2),
+                "中位數%": round(float(np.median(arr)), 2),
+                "勝率%": round(float((arr > 0).mean() * 100), 1),
+            }
+        results[h] = {
+            "設定": {"股票數": len(history), "持有交易日": h,
+                    "取樣間隔": step, "歷史長度": period, "總樣本": samples[h]},
+            "分組結果": groups,
         }
-    return result
+    return results
+
+
+def _print_comparison(results: dict):
+    """Print a high-score-vs-threshold comparison table across horizons."""
+    horizons = sorted(results)
+    print(f"\n{'持有日':>5} | {'高分 報酬/勝率':>16} | {'中分':>14} | "
+          f"{'低分':>14} | {'未達門檻':>14} | {'高分每日%':>8}")
+    print("-" * 88)
+    for h in horizons:
+        g = results[h]["分組結果"]
+
+        def cell(name):
+            d = g.get(name, {})
+            if not d.get("樣本數"):
+                return f"{'—':>14}"
+            return f"{d['平均報酬%']:>6.2f}% /{d['勝率%']:>5.1f}%"
+
+        hi = g.get("高分(≥55)", {})
+        per_day = f"{hi['平均報酬%'] / h:.2f}" if hi.get("樣本數") else "—"
+        print(f"{h:>5} | {cell('高分(≥55)'):>16} | {cell('中分(45-54)')} | "
+              f"{cell('低分(<45)')} | {cell('未達門檻(<35)')} | {per_day:>8}")
+
+    # Which horizon gives the cleanest monotonic ordering by avg return?
+    best_h, best_spread = None, -1e9
+    for h in horizons:
+        g = results[h]["分組結果"]
+        vals = [g.get(n, {}).get("平均報酬%") for n in _BUCKET_NAMES]
+        if any(v is None for v in vals):
+            continue
+        monotonic = all(vals[i] >= vals[i + 1] for i in range(len(vals) - 1))
+        spread = vals[0] - vals[-1]
+        if monotonic and spread > best_spread:
+            best_h, best_spread = h, spread
+    if best_h is not None:
+        print(f"\n結論：持有 {best_h} 日的評分鑑別度最乾淨（四組報酬單調遞增，"
+              f"高分−未達門檻 = {best_spread:.2f}pp）")
+    else:
+        print("\n結論：各 horizon 的分組排序皆非完全單調，評分鑑別度有限")
 
 
 def main():
@@ -106,6 +163,8 @@ def main():
     p.add_argument("--stocks", type=int, default=120, help="取樣股票數（最流動）")
     p.add_argument("--codes", type=str, default="", help="指定代號，逗號分隔（覆蓋 --stocks）")
     p.add_argument("--horizon", type=int, default=10, help="持有交易日")
+    p.add_argument("--compare-horizons", type=str, default="",
+                   help="一次比較多個 horizon，逗號分隔，例如 5,10,20")
     p.add_argument("--step", type=int, default=5, help="取樣間隔（交易日）")
     p.add_argument("--period", type=str, default="2y", help="yfinance 歷史長度")
     p.add_argument("--debug", action="store_true")
@@ -120,9 +179,15 @@ def main():
     else:
         code_exchanges = _pick_codes(args.stocks)
 
-    result = backtest(code_exchanges, args.horizon, args.step, args.period)
-
     import json
+    if args.compare_horizons:
+        horizons = sorted({int(h) for h in args.compare_horizons.split(",") if h.strip()})
+        results = backtest(code_exchanges, horizons, args.step, args.period)
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        _print_comparison(results)
+        return
+
+    result = backtest(code_exchanges, [args.horizon], args.step, args.period)[args.horizon]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     groups = result["分組結果"]
