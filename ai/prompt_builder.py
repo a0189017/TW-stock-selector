@@ -57,7 +57,7 @@ def build_user_prompt(candidates: list[dict], market_summary: dict) -> str:
             "產業": s.get("industry", "其他"),
             "交易所": s.get("exchange", ""),
             "收盤": s.get("close", 0),
-            "漲跌%": s.get("change_pct", 0),
+            "漲跌_%": s.get("change_pct", 0),
             "技術評分": s.get("tech_score", 0),
             "技術信號": s.get("tech_signals", []),
             "技術指標": serialize_tech(s),
@@ -66,43 +66,51 @@ def build_user_prompt(candidates: list[dict], market_summary: dict) -> str:
         }
         stocks_data.append(entry)
 
-    # Build hot sectors section
-    hot_sectors = market_summary.get("hot_sectors", [])
+    # Build hot sectors section (consumes canonical 強勢族群 dicts — raw values)
+    hot_sectors = market_summary.get("強勢族群", [])
     if hot_sectors:
         sectors_lines = []
         for s in hot_sectors:
-            sign = "+" if s["avg_change_pct"] >= 0 else ""
             sectors_lines.append(
-                f"  - {s['industry']}：平均漲幅 {sign}{s['avg_change_pct']}%，"
-                f"上漲率 {s['up_ratio_pct']}%（{s['up_count']}/{s['stock_count']}支），"
-                f"三大法人 {s['big3_net']:+,.0f} 張，成交值 {s['trade_value_b']} 億"
+                f"  - {s['產業']}：平均漲幅 {s['平均漲幅_%']:+.2f}%，"
+                f"上漲率 {s['上漲率_%']}%（{s['上漲家數']}/{s['成分股數']}支），"
+                f"三大法人 {s['三大法人淨買_張']:+,.0f} 張，成交值 {s['成交值_億']} 億"
             )
         hot_sectors_text = "\n".join(sectors_lines)
     else:
         hot_sectors_text = "  （資料不足）"
 
-    # Build hot stocks section
-    hot_stocks = market_summary.get("hot_stocks", [])
+    # Build hot stocks section (consumes canonical 強勢個股 dicts — raw values)
+    hot_stocks = market_summary.get("強勢個股", [])
     if hot_stocks:
         stocks_lines = []
         for s in hot_stocks:
-            sign = "+" if s["change_pct"] >= 0 else ""
             stocks_lines.append(
-                f"  - {s['code']} {s['name']}（{s['industry']}）：{sign}{s['change_pct']}%，"
-                f"收盤 {s['close']}，外資 {s['foreign_net_today']:+,.0f} 張，"
-                f"投信 {s['trust_net_today']:+,.0f} 張，外資5日 {s['foreign_net_5d']:+,.0f} 張"
+                f"  - {s['代號']} {s['名稱']}（{s['產業']}）：{s['漲跌_%']:+.2f}%，"
+                f"收盤 {s['收盤']}，外資 {s['外資今日淨買_張']:+,.0f} 張，"
+                f"投信 {s['投信今日淨買_張']:+,.0f} 張，外資5日 {s['外資5日淨買_張']:+,.0f} 張"
             )
         hot_stocks_text = "\n".join(stocks_lines)
     else:
         hot_stocks_text = "  （資料不足）"
 
+    # Market summary numbers are now raw — format them here for the prompt text.
+    taiex = market_summary.get("加權指數")
+    taiex_chg = market_summary.get("加權指數漲跌")
+    taiex_pct = market_summary.get("加權指數漲跌_%")
+    taiex_str = f"{taiex:,.2f}" if taiex is not None else "—"
+    taiex_chg_str = (f"{taiex_chg:+,.2f} / {taiex_pct:+.2f}%"
+                     if taiex_chg is not None else "—")
+    foreign_total = market_summary.get("外資合計淨買_張")
+    foreign_str = f"{foreign_total:+,.0f} 張" if foreign_total is not None else "—"
+
     prompt = f"""今天是 {today}，以下是經過三階段篩選後的 {len(candidates)} 檔候選股票。
 
 【今日大盤數據】
-- 上市成交量：{market_summary.get('volume_b', '—')} 億
-- 上漲/持平/下跌家數：{market_summary.get('up', '—')}/{market_summary.get('flat', '—')}/{market_summary.get('down', '—')}
-- 加權指數：{market_summary.get('taiex', '—')} （{market_summary.get('taiex_change', '—')}）
-- 外資合計：{market_summary.get('foreign_total', '—')}
+- 上市成交量：{market_summary.get('成交值_億', '—')} 億
+- 上漲/持平/下跌家數：{market_summary.get('上漲家數', '—')}/{market_summary.get('持平家數', '—')}/{market_summary.get('下跌家數', '—')}
+- 加權指數：{taiex_str} （{taiex_chg_str}）
+- 外資合計：{foreign_str}
 
 【今日強勢、熱門族群（Top 5）】
 {hot_sectors_text}

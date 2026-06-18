@@ -181,7 +181,7 @@ def run_health_check() -> dict:
     ]
     from data.fetcher_history import fetch_history
     from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
-    from analysis.common import extract_indicators, serialize_chip
+    from analysis.common import extract_indicators, serialize_chip, serialize_tech, SCHEMA_VERSION
     # Always bypass cache for history reads here: holdings may not be in the
     # screener cache, and we want the most current prices for risk assessment.
     history = fetch_history(candidates, bypass_cache=True, include_taiex=True)
@@ -202,7 +202,8 @@ def run_health_check() -> dict:
         ind = extract_indicators(df_ind)
         ind["tech_score"] = t_score
         ind["tech_signals"] = t_signals
-        ind["rs_label"] = rs.get("rs_label", "—")
+        ind["rs_label"] = rs.get("rs_label")
+        ind["rs20"] = rs.get("rs20")
         tech_map[code] = ind
 
     # ---- Assemble results ----
@@ -252,28 +253,17 @@ def run_health_check() -> dict:
             "持有張數": shares,
             "成本均價": cost_price,
             "現價": current_price,
-            "今日漲跌%": today_chg,
+            "今日漲跌_%": today_chg,
             "損益": {
-                "未實現損益(元)": round(pnl_twd),
-                "報酬率%": round(return_pct, 2),
-                "持有市值(元)": round(value_twd),
-                "持有成本(元)": round(cost_twd),
+                "未實現損益_元": round(pnl_twd),
+                "報酬率_%": round(return_pct, 2),
+                "持有市值_元": round(value_twd),
+                "持有成本_元": round(cost_twd),
             },
             "技術面": {
-                "技術評分": tech.get("tech_score", "—"),
+                "技術評分": tech.get("tech_score"),
                 "技術信號": tech.get("tech_signals", []),
-                "KD(K/D)": f"{tech.get('kd_k', 0):.1f}/{tech.get('kd_d', 0):.1f}",
-                "RSI": f"{tech.get('rsi', 50):.1f}",
-                "布林%B": f"{tech.get('bb_pct', 0.5):.2f}",
-                "MACD柱": tech.get("macd_hist", 0),
-                "均線結構": tech.get("ma_structure", "—"),
-                "相對大盤強度": tech.get("rs_label", "—"),
-                "20MA乖離": f"{tech.get('bias20', 0):+.1f}%",
-                "60MA乖離": f"{tech.get('bias60', 0):+.1f}%",
-                "量比": f"{tech.get('vol_ratio', 0):.1f}x",
-                "MA20": tech.get("ma20", 0),
-                "MA60": ma60,
-                "MA240": tech.get("ma240", 0),
+                **serialize_tech(tech, full=True),
             },
             "籌碼面": serialize_chip(chip),
             "預判建議": pre_rec,
@@ -285,13 +275,14 @@ def run_health_check() -> dict:
                     if total_cost_twd > 0 else 0.0)
 
     return {
+        "格式版本": SCHEMA_VERSION,
         "資料日期": datetime.today().strftime("%Y-%m-%d"),
         "持股概況": {
             "持股檔數": len(results),
-            "總持有成本(元)": round(total_cost_twd),
-            "總市值(元)": round(total_value_twd),
-            "總未實現損益(元)": round(total_value_twd - total_cost_twd),
-            "整體報酬率%": round(total_return, 2),
+            "總持有成本_元": round(total_cost_twd),
+            "總市值_元": round(total_value_twd),
+            "總未實現損益_元": round(total_value_twd - total_cost_twd),
+            "整體報酬率_%": round(total_return, 2),
         },
         "持股明細": results,
     }

@@ -344,9 +344,8 @@ def fetch_chip_data(dates: list[str] | None = None) -> pd.DataFrame:
     return result.reset_index()
 
 
-def compute_market_foreign_total(chip_df: pd.DataFrame) -> str:
-    """Sum 外資 today net across all stocks in 億張."""
+def compute_market_foreign_total(chip_df: pd.DataFrame) -> float | None:
+    """Sum 外資 today net (張) across all stocks. Raw number; None if unavailable."""
     if chip_df.empty or "foreign_net_today" not in chip_df.columns:
-        return "—"
-    total = chip_df["foreign_net_today"].sum()
-    return f"{total:+,.0f} 張"
+        return None
+    return round(float(chip_df["foreign_net_today"].sum()))

@@ -22,21 +22,19 @@ def patch_cache_if_no_cache(no_cache: bool):
     set_bypass(read=no_cache)
 
 
-def get_taiex_info(history: dict) -> tuple[str, str]:
-    """Extract TAIEX last price and change from fetched history."""
+def get_taiex_info(history: dict) -> tuple[float | None, float | None, float | None]:
+    """Extract TAIEX (last, change, change%) as raw numbers from fetched history."""
     taiex_df = history.get("^TWII")
     if taiex_df is None or taiex_df.empty:
-        return "—", "—"
+        return None, None, None
     closes = taiex_df["Close"].dropna()
     if len(closes) < 2:
-        return f"{closes.iloc[-1]:,.2f}", "—"
-    last = closes.iloc[-1]
-    prev = closes.iloc[-2]
+        return round(float(closes.iloc[-1]), 2), None, None
+    last = float(closes.iloc[-1])
+    prev = float(closes.iloc[-2])
     change = last - prev
     pct = change / prev * 100
-    sign = "+" if change >= 0 else ""
-    change_str = f"({sign}{change:,.2f} / {sign}{pct:.2f}%)"
-    return f"{last:,.2f}", change_str
+    return round(last, 2), round(change, 2), round(pct, 2)
 
 
 def main():
@@ -77,18 +75,15 @@ def main():
         from config import get_recent_weekdays
         dates = get_recent_weekdays(7)[:5]
         chip_df = fetch_chip_data(dates)
-        foreign_total = compute_market_foreign_total(chip_df)
-        market_summary["foreign_total"] = foreign_total
+        market_summary["外資合計淨買_張"] = compute_market_foreign_total(chip_df)
         progress.update(task, description=f"Phase 2/5  籌碼資料 ✓  {len(chip_df)} 支有籌碼數據")
 
         # ----------------------------------------------------------------
         # Compute hot sectors and hot stocks from full universe
         # ----------------------------------------------------------------
         from analysis.market_hot import compute_hot_sectors, compute_hot_stocks
-        hot_sectors = compute_hot_sectors(universe_df, chip_df, top_n=5)
-        hot_stocks = compute_hot_stocks(universe_df, chip_df, top_n=10)
-        market_summary["hot_sectors"] = hot_sectors
-        market_summary["hot_stocks"] = hot_stocks
+        market_summary["強勢族群"] = compute_hot_sectors(universe_df, chip_df, top_n=5)
+        market_summary["強勢個股"] = compute_hot_stocks(universe_df, chip_df, top_n=10)
 
         # ----------------------------------------------------------------
         # Stage 1 + 2 Screening (instant)
@@ -114,10 +109,11 @@ def main():
         history = fetch_history(candidates_info)
         progress.update(task, description=f"Phase 3/5  歷史資料 ✓  {len(history)} 支成功下載")
 
-        # Update TAIEX in market summary
-        taiex_price, taiex_change = get_taiex_info(history)
-        market_summary["taiex"] = taiex_price
-        market_summary["taiex_change"] = taiex_change
+        # Update TAIEX in market summary (raw numbers)
+        taiex_price, taiex_change, taiex_pct = get_taiex_info(history)
+        market_summary["加權指數"] = taiex_price
+        market_summary["加權指數漲跌"] = taiex_change
+        market_summary["加權指數漲跌_%"] = taiex_pct
 
         # ----------------------------------------------------------------
         # Stage 3: Technical scoring

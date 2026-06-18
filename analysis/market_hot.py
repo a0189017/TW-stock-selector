@@ -56,16 +56,16 @@ def compute_hot_sectors(universe_df: pd.DataFrame,
     result = []
     for _, row in top.iterrows():
         result.append({
-            "industry": row["industry"],
-            "stock_count": int(row["stock_count"]),
-            "up_count": int(row["up_count"]),
-            "down_count": int(row["down_count"]),
-            "avg_change_pct": round(float(row["avg_change_pct"]), 2),
-            "up_ratio_pct": round(float(row["up_ratio"]) * 100, 1),
-            "trade_value_b": round(float(row["total_trade_value"]) / 1e8, 1),
-            "foreign_net": round(float(row["foreign_net"]), 0),
-            "trust_net": round(float(row["trust_net"]), 0),
-            "big3_net": round(float(row["big3_net"]), 0),
+            "產業": row["industry"],
+            "成分股數": int(row["stock_count"]),
+            "上漲家數": int(row["up_count"]),
+            "下跌家數": int(row["down_count"]),
+            "平均漲幅_%": round(float(row["avg_change_pct"]), 2),
+            "上漲率_%": round(float(row["up_ratio"]) * 100, 1),
+            "成交值_億": round(float(row["total_trade_value"]) / 1e8, 1),
+            "外資淨買_張": round(float(row["foreign_net"])),
+            "投信淨買_張": round(float(row["trust_net"])),
+            "三大法人淨買_張": round(float(row["big3_net"])),
         })
     return result
 
@@ -119,15 +119,15 @@ def compute_hot_stocks(universe_df: pd.DataFrame,
     result = []
     for _, row in top.iterrows():
         result.append({
-            "code": row["code"],
-            "name": row["name"],
-            "industry": row.get("industry", "其他"),
-            "close": row["close"],
-            "change_pct": round(float(row["change_pct"]), 2),
-            "trade_value_b": round(float(row["trade_value"]) / 1e8, 2),
-            "foreign_net_today": round(float(row["foreign_net_today"]), 0),
-            "trust_net_today": round(float(row["trust_net_today"]), 0),
-            "big3_net_today": round(float(row["big3_net_today"]), 0),
-            "foreign_net_5d": round(float(row["foreign_net_5d"]), 0),
+            "代號": row["code"],
+            "名稱": row["name"],
+            "產業": row.get("industry", "其他"),
+            "收盤": round(float(row["close"]), 2),
+            "漲跌_%": round(float(row["change_pct"]), 2),
+            "成交值_億": round(float(row["trade_value"]) / 1e8, 2),
+            "外資今日淨買_張": round(float(row["foreign_net_today"])),
+            "投信今日淨買_張": round(float(row["trust_net_today"])),
+            "三大法人今日淨買_張": round(float(row["big3_net_today"])),
+            "外資5日淨買_張": round(float(row["foreign_net_5d"])),
         })
     return result

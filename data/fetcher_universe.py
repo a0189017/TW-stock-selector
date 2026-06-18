@@ -431,12 +431,15 @@ def fetch_market_summary(universe_df: pd.DataFrame) -> dict:
     flat = int((twse["change"] == 0).sum())
     total_value_b = round(twse["trade_value"].sum() / 1e8, 1)
 
+    # Canonical 大盤概況 — raw values, Chinese keys. taiex/外資合計 are filled in
+    # later by the pipeline once history/chip data is available; default to None.
     return {
-        "up": up,
-        "down": down,
-        "flat": flat,
-        "volume_b": total_value_b,
-        "taiex": "—",
-        "taiex_change": "—",
-        "foreign_total": "—",
+        "上漲家數": up,
+        "下跌家數": down,
+        "持平家數": flat,
+        "成交值_億": total_value_b,
+        "加權指數": None,
+        "加權指數漲跌": None,
+        "加權指數漲跌_%": None,
+        "外資合計淨買_張": None,
     }

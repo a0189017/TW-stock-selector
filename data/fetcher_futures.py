@@ -182,7 +182,7 @@ def fetch_futures_summary(taiex_close: float = 0.0) -> dict:
 
     result = {}
 
-    # --- 正逆價差 ---
+    # --- 正逆價差 (raw numbers + label) ---
     tx_close = fetch_tx_close()
     if tx_close > 0 and taiex_close > 0:
         basis = round(tx_close - taiex_close, 1)
@@ -195,17 +195,17 @@ def fetch_futures_summary(taiex_close: float = 0.0) -> dict:
         else:
             sentiment = "逆價差偏大，空方或大量避險"
 
-        result["台指期收盤"] = tx_close
-        result["正逆價差(點)"] = f"{basis:+.0f}"
+        result["台指期收盤"] = round(tx_close, 1)
+        result["正逆價差_點"] = basis
         result["價差解讀"] = sentiment
 
-    # --- 三大法人留倉 ---
+    # --- 三大法人留倉 (raw 口數 + 方向 label) ---
     insti = fetch_futures_institutional()
     if insti:
         fn = insti.get("foreign_net", 0)
         dn = insti.get("dealer_net", 0)
-        result["外資期貨淨口"] = f"{fn:+,d} 口"
-        result["自營商期貨淨口"] = f"{dn:+,d} 口"
+        result["外資期貨淨口_口"] = fn
+        result["自營商期貨淨口_口"] = dn
         result["外資期貨方向"] = (
             "淨多（看多後市）" if fn > 0 else
             "淨空（看空/避險）" if fn < 0 else "中立"

@@ -136,6 +136,8 @@ pytest
 資料有 cache（diskcache，預設 TTL 1 小時；全市場行情採 45 分／5 分自適應），避免頻繁打 API。
 持股健檢與績效評估執行時不寫入 cache，避免污染選股快取。
 
+所有工具的輸出格式規範見 [`docs/OUTPUT_SCHEMA.md`](docs/OUTPUT_SCHEMA.md)（原始值 + 中文鍵 + 單位後綴，由 `analysis/common.py` 的 `serialize_*` 統一產出）。
+
 ---
 
 ## 專案結構

@@ -117,7 +117,8 @@ def evaluate_performance(horizon: int = 10, min_age_days: int = 14) -> dict:
             continue
         bucket = "高分(≥55)" if score >= 55 else "中分(45-54)" if score >= 45 else "低分(<45)"
         buckets[bucket].append(fwd)
-        detail.append({"date": date, "code": code, "score": score, f"fwd{horizon}d%": round(fwd, 2)})
+        detail.append({"日期": date, "代號": code, "技術評分": score,
+                       f"未來{horizon}日報酬_%": round(fwd, 2)})
 
     summary = {}
     for name, rets in buckets.items():
@@ -127,16 +128,18 @@ def evaluate_performance(horizon: int = 10, min_age_days: int = 14) -> dict:
         wins = sum(1 for r in rets if r > 0)
         summary[name] = {
             "樣本數": len(rets),
-            "平均報酬%": round(sum(rets) / len(rets), 2),
-            "勝率%": round(wins / len(rets) * 100, 1),
-            "最佳%": round(max(rets), 2),
-            "最差%": round(min(rets), 2),
+            "平均報酬_%": round(sum(rets) / len(rets), 2),
+            "勝率_%": round(wins / len(rets) * 100, 1),
+            "最佳_%": round(max(rets), 2),
+            "最差_%": round(min(rets), 2),
         }
 
+    from analysis.common import SCHEMA_VERSION
     return {
+        "格式版本": SCHEMA_VERSION,
         "評估設定": {"持有交易日": horizon, "最小樣本天數": min_age_days},
         "依技術評分分組": summary,
-        "樣本明細": sorted(detail, key=lambda d: d["date"], reverse=True)[:50],
+        "樣本明細": sorted(detail, key=lambda d: d["日期"], reverse=True)[:50],
     }
 
 

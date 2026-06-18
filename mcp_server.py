@@ -218,9 +218,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         shares = float(arguments.get("shares", 0))
         cost = float(arguments.get("cost", 0))
         if not code or shares <= 0 or cost <= 0:
-            return [types.TextContent(type="text", text=json.dumps(
-                {"error": "code、shares、cost 都是必填，且必須大於 0"},
-                ensure_ascii=False))]
+            return [types.TextContent(type="text",
+                text=_error_json("code、shares、cost 都是必填，且必須大於 0"))]
         result = add_holding(code, shares, cost)
         return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -236,8 +235,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name == "analyze_stock":
         code = str(arguments.get("code", "")).strip()
         if not code:
-            return [types.TextContent(type="text", text=json.dumps(
-                {"error": "請提供股票代號，例如 '2330'"}, ensure_ascii=False))]
+            return [types.TextContent(type="text",
+                text=_error_json("請提供股票代號，例如 '2330'"))]
         result_text = await loop.run_in_executor(
             None, lambda: _run_stock_analysis(code, no_cache)
         )
@@ -266,6 +265,14 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=result_text)]
 
 
+def _error_json(message: str, traceback_str: str | None = None) -> str:
+    """Canonical error envelope shared by all tools (see docs/OUTPUT_SCHEMA.md)."""
+    err = {"訊息": message}
+    if traceback_str:
+        err["traceback"] = traceback_str
+    return json.dumps({"error": err}, ensure_ascii=False, indent=2)
+
+
 def _run_health_check(no_cache: bool = False) -> str:
     """Run portfolio health check and return JSON."""
     from data.cache import set_bypass
@@ -283,10 +290,7 @@ def _run_health_check(no_cache: bool = False) -> str:
             set_bypass(read=False, write=False)
     except Exception as e:
         import traceback
-        return json.dumps(
-            {"error": str(e), "traceback": traceback.format_exc()},
-            ensure_ascii=False,
-        )
+        return _error_json(str(e), traceback.format_exc())
 
 
 def _run_screener_performance(horizon: int = 10, min_age_days: int = 14) -> str:
@@ -302,10 +306,7 @@ def _run_screener_performance(horizon: int = 10, min_age_days: int = 14) -> str:
             set_bypass(read=False, write=False)
     except Exception as e:
         import traceback
-        return json.dumps(
-            {"error": str(e), "traceback": traceback.format_exc()},
-            ensure_ascii=False,
-        )
+        return _error_json(str(e), traceback.format_exc())
 
 
 def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = False) -> str:
@@ -324,19 +325,19 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
         # Phase 1: Universe
         universe_df = fetch_universe()
         if universe_df.empty:
-            return json.dumps({"error": "無法取得股票清單，請確認網路連線"}, ensure_ascii=False)
+            return _error_json("無法取得股票清單，請確認網路連線")
 
         market_summary = fetch_market_summary(universe_df)
 
         # Phase 2: Chip data
         dates = get_recent_weekdays(7)[:5]
         chip_df = fetch_chip_data(dates)
-        market_summary["foreign_total"] = compute_market_foreign_total(chip_df)
+        market_summary["外資合計淨買_張"] = compute_market_foreign_total(chip_df)
 
         # Hot sectors and stocks (full universe, before screening)
         from analysis.market_hot import compute_hot_sectors, compute_hot_stocks
-        market_summary["hot_sectors"] = compute_hot_sectors(universe_df, chip_df, top_n=5)
-        market_summary["hot_stocks"] = compute_hot_stocks(universe_df, chip_df, top_n=10)
+        market_summary["強勢族群"] = compute_hot_sectors(universe_df, chip_df, top_n=5)
+        market_summary["強勢個股"] = compute_hot_stocks(universe_df, chip_df, top_n=10)
 
         # Stage 1 + 2
         s1 = stage1_liquidity(universe_df)
@@ -357,9 +358,9 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
                 last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
                 chg = last - prev
                 pct = chg / prev * 100
-                sign = "+" if chg >= 0 else ""
-                market_summary["taiex"] = f"{last:,.2f}"
-                market_summary["taiex_change"] = f"({sign}{chg:,.2f} / {sign}{pct:.2f}%)"
+                market_summary["加權指數"] = round(last, 2)
+                market_summary["加權指數漲跌"] = round(chg, 2)
+                market_summary["加權指數漲跌_%"] = round(pct, 2)
 
                 # Futures overlay: basis + institutional positions
                 from data.fetcher_futures import fetch_futures_summary
@@ -393,7 +394,7 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
                 "產業": d.get("industry", ""),
                 "交易所": d.get("exchange", ""),
                 "收盤": d.get("close", 0),
-                "漲跌%": d.get("change_pct", 0),
+                "漲跌_%": d.get("change_pct", 0),
                 "技術評分": d.get("tech_score", 0),
                 "技術信號": d.get("tech_signals", []),
                 "技術指標": serialize_tech(d),
@@ -411,7 +412,7 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
                 qt = rt_quotes.get(s["代號"])
                 if qt:
                     s["收盤"] = qt["close"]
-                    s["漲跌%"] = qt["change_pct"]
+                    s["漲跌_%"] = qt["change_pct"]
                     rt_count += 1
 
         from datetime import datetime
@@ -432,7 +433,9 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
         else:
             data_note = f"最近交易日資料（使用 {data_date} 收盤價，盤中或資料尚未更新）"
 
+        from analysis.common import SCHEMA_VERSION
         output = {
+            "格式版本": SCHEMA_VERSION,
             "資料日期": data_date,
             "資料說明": data_note,
             "篩選結果": {
@@ -450,10 +453,7 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
 
     except Exception as e:
         import traceback
-        return json.dumps({
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }, ensure_ascii=False)
+        return _error_json(str(e), traceback.format_exc())
     finally:
         set_bypass(read=False, write=False)
 
@@ -471,10 +471,7 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
         from config import get_recent_weekdays
 
         if not (code.isdigit() and len(code) == 4):
-            return json.dumps(
-                {"error": f"無效的股票代號：{code}，請輸入 4 位數字代號（例如 '2330'）"},
-                ensure_ascii=False,
-            )
+            return _error_json(f"無效的股票代號：{code}，請輸入 4 位數字代號（例如 '2330'）")
 
         set_bypass(read=no_cache, write=False)
 
@@ -508,20 +505,14 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
                     break
 
         if not exchange:
-            return json.dumps(
-                {"error": f"找不到股票 {code}，請確認代號是否正確"},
-                ensure_ascii=False,
-            )
+            return _error_json(f"找不到股票 {code}，請確認代號是否正確")
 
         suffix = ".TW" if exchange == "TWSE" else ".TWO"
         ticker = f"{code}{suffix}"
         df_hist = history.get(ticker)
 
         if df_hist is None or df_hist.empty:
-            return json.dumps(
-                {"error": f"無法取得 {code} 的歷史 K 線，資料可能尚未更新"},
-                ensure_ascii=False,
-            )
+            return _error_json(f"無法取得 {code} 的歷史 K 線，資料可能尚未更新")
 
         # ---- Step 3: Technical indicators ----
         df_ind = add_all_indicators(df_hist)
@@ -534,7 +525,8 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
         tech_score, tech_signals = score_stock(df_ind, rs=rs, fundamental=fund)
 
         ind = extract_indicators(df_ind)
-        ind["rs_label"] = rs.get("rs_label", "—")
+        ind["rs_label"] = rs.get("rs_label")
+        ind["rs20"] = rs.get("rs20")
         close_price = ind.get("yf_close", 0)
 
         # ---- Step 5: Chip data ----
@@ -556,21 +548,23 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
                 "高": round(float(row.get("High", 0)), 2),
                 "低": round(float(row.get("Low", 0)), 2),
                 "收": round(float(row.get("Close", 0)), 2),
-                "量(張)": int(vol_shares / 1000),
+                "量_張": int(vol_shares / 1000),
             })
 
         # ---- Build output ----
+        from analysis.common import SCHEMA_VERSION
         current_close = info.get("close", close_price)
         output = {
+            "格式版本": SCHEMA_VERSION,
             "代號": code,
             "名稱": name,
             "交易所": exchange,
             "產業": info.get("industry", "其他"),
-            "收盤價": current_close,
-            "漲跌%": info.get("change_pct", 0),
+            "收盤": current_close,
+            "漲跌_%": info.get("change_pct", 0),
             "PE": info.get("pe_ratio", 0),
             "PB": info.get("pb_ratio", 0),
-            "殖利率%": info.get("div_yield", 0),
+            "殖利率_%": info.get("div_yield", 0),
             "技術評分": tech_score,
             "技術信號": tech_signals,
             "技術指標": serialize_tech(ind, full=True),
@@ -583,10 +577,7 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
 
     except Exception as e:
         import traceback
-        return json.dumps(
-            {"error": str(e), "traceback": traceback.format_exc()},
-            ensure_ascii=False,
-        )
+        return _error_json(str(e), traceback.format_exc())
     finally:
         set_bypass(read=False, write=False)
 

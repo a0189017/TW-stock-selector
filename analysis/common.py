@@ -64,54 +64,92 @@ def extract_indicators(df_ind: pd.DataFrame) -> dict:
     }
 
 
+# Canonical output-format version. See docs/OUTPUT_SCHEMA.md for the full spec.
+# Bump when key names / value semantics of any serialize_* block change.
+SCHEMA_VERSION = "1.0"
+
+
+def _r0(x):
+    """Round to nearest integer (張/口/家數). Pass through None/non-numeric."""
+    return round(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else x
+
+
+def _r2(x):
+    """Round to 2 decimals (%/價). Pass through None/non-numeric."""
+    return round(x, 2) if isinstance(x, (int, float)) and not isinstance(x, bool) else x
+
+
+# Canonical key sets — used by tests to enforce the schema contract.
+TECH_KEYS = (
+    "KD_K", "KD_D", "RSI", "布林%B", "MACD柱",
+    "乖離_MA5_%", "乖離_MA20_%", "乖離_MA60_%",
+    "量比", "均線結構", "相對大盤強度", "RS_20日_%", "MA20", "MA60",
+)
+CHIP_KEYS = (
+    "外資今日淨買_張", "外資5日淨買_張", "外資連續買超_日",
+    "投信今日淨買_張", "三大法人今日淨買_張",
+    "融資餘額變化_%", "融資使用率_%", "融券餘額變化_%", "券資比_%",
+)
+FUNDAMENTAL_KEYS = ("最新月營收_億", "月營收YoY_%", "月營收MoM_%", "營收月份")
+
+
 def serialize_tech(d: dict, full: bool = False) -> dict:
-    """Build the 技術指標 JSON block from a flat indicator dict."""
+    """
+    技術指標 block — RAW numeric values under canonical Chinese keys (units in key
+    names). The model formats for display; missing numerics are null. Labels
+    (均線結構 / 相對大盤強度) stay as strings.
+    """
     block = {
-        "KD(K/D)": f"{d.get('kd_k', 50):.1f}/{d.get('kd_d', 50):.1f}",
-        "RSI": f"{d.get('rsi', 50):.1f}",
-        "布林%B": f"{d.get('bb_pct', 0.5):.2f}",
-        "MACD柱": f"{d.get('macd_hist', 0):.4f}",
-        "均線乖離(MA5/MA20/MA60)": (
-            f"{d.get('bias5', 0):+.1f}%/"
-            f"{d.get('bias20', 0):+.1f}%/"
-            f"{d.get('bias60', 0):+.1f}%"
-        ),
-        "量比": f"{d.get('vol_ratio', 1):.1f}x",
-        "均線結構": d.get("ma_structure", "整理"),
-        "相對大盤強度": d.get("rs_label", "—"),
-        "MA20": d.get("ma20", 0),
-        "MA60": d.get("ma60", 0),
+        "KD_K": _r2(d.get("kd_k")),
+        "KD_D": _r2(d.get("kd_d")),
+        "RSI": _r2(d.get("rsi")),
+        "布林%B": _r2(d.get("bb_pct")),
+        "MACD柱": d.get("macd_hist"),
+        "乖離_MA5_%": _r2(d.get("bias5")),
+        "乖離_MA20_%": _r2(d.get("bias20")),
+        "乖離_MA60_%": _r2(d.get("bias60")),
+        "量比": _r2(d.get("vol_ratio")),
+        "均線結構": d.get("ma_structure"),
+        "相對大盤強度": d.get("rs_label"),
+        "RS_20日_%": _r2(d.get("rs20")),
+        "MA20": _r2(d.get("ma20")),
+        "MA60": _r2(d.get("ma60")),
     }
     if full:
-        block["MA5"] = d.get("ma5", 0)
-        block["MA10"] = d.get("ma10", 0)
-        block["MA120"] = d.get("ma120", 0)
-        block["MA240"] = d.get("ma240", 0)
+        block["MA5"] = _r2(d.get("ma5"))
+        block["MA10"] = _r2(d.get("ma10"))
+        block["MA120"] = _r2(d.get("ma120"))
+        block["MA240"] = _r2(d.get("ma240"))
     return block
 
 
 def serialize_chip(d: dict) -> dict:
-    """Build the 籌碼 JSON block from a flat chip dict."""
+    """籌碼 block — RAW values (張 rounded to int, % to 2dp). Missing → null."""
     return {
-        "外資今日淨買(張)": f"{d.get('foreign_net_today', 0):+,.0f}",
-        "外資5日淨買(張)": f"{d.get('foreign_net_5d', 0):+,.0f}",
-        "外資連續買超(日)": int(d.get("foreign_consec_buy", 0)),
-        "投信今日淨買(張)": f"{d.get('trust_net_today', 0):+,.0f}",
-        "三大法人今日(張)": f"{d.get('big3_net_today', 0):+,.0f}",
-        "融資餘額變化": f"{d.get('margin_change_pct', 0):+.1f}%",
-        "融資使用率": f"{d.get('margin_util_rate', 0):.1f}%",
-        "融券餘額變化": f"{d.get('short_change_pct', 0):+.1f}%",
-        "券資比": f"{d.get('short_margin_ratio', 0):.1f}%",
+        "外資今日淨買_張": _r0(d.get("foreign_net_today")),
+        "外資5日淨買_張": _r0(d.get("foreign_net_5d")),
+        "外資連續買超_日": _r0(d.get("foreign_consec_buy")),
+        "投信今日淨買_張": _r0(d.get("trust_net_today")),
+        "三大法人今日淨買_張": _r0(d.get("big3_net_today")),
+        "融資餘額變化_%": _r2(d.get("margin_change_pct")),
+        "融資使用率_%": _r2(d.get("margin_util_rate")),
+        "融券餘額變化_%": _r2(d.get("short_change_pct")),
+        "券資比_%": _r2(d.get("short_margin_ratio")),
     }
 
 
 def serialize_fundamental(d: dict) -> dict:
-    """Build the 基本面 JSON block from a flat fundamental dict (may be empty)."""
-    if not d:
-        return {}
-    return {
-        "最新月營收(億)": d.get("revenue_b", "—"),
-        "月營收YoY%": f"{d.get('rev_yoy', 0):+.1f}%" if d.get("rev_yoy") is not None else "—",
-        "月營收MoM%": f"{d.get('rev_mom', 0):+.1f}%" if d.get("rev_mom") is not None else "—",
-        "營收月份": d.get("rev_month", "—"),
+    """
+    基本面 block — RAW values. Returns {} when there is no fundamental data at all
+    (all fields null) — works whether called with the fund sub-dict or a full stock
+    row that merely carries null revenue_* keys. Partial data → block with nulls.
+    """
+    block = {
+        "最新月營收_億": _r2(d.get("revenue_b")),
+        "月營收YoY_%": _r2(d.get("rev_yoy")),
+        "月營收MoM_%": _r2(d.get("rev_mom")),
+        "營收月份": d.get("rev_month"),
     }
+    if all(v is None for v in block.values()):
+        return {}
+    return block
