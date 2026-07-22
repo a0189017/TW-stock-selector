@@ -1,6 +1,8 @@
 """Save daily report to reports/YYYY-MM-DD_report.md."""
 from pathlib import Path
-from datetime import datetime
+
+from analysis.common import format_taiex, format_foreign_total
+from config import taipei_now
 
 
 REPORTS_DIR = Path(__file__).parent.parent / "reports"
@@ -11,18 +13,14 @@ def save_report(analysis_text: str, market_summary: dict, candidate_count: int) 
     Save report to disk. Returns the file path.
     """
     REPORTS_DIR.mkdir(exist_ok=True)
-    today = datetime.today().strftime("%Y-%m-%d")
+    today = taipei_now().strftime("%Y-%m-%d")
     path = REPORTS_DIR / f"{today}_report.md"
 
     # market_summary holds raw numbers (canonical schema) — format for display here.
-    taiex = market_summary.get("加權指數")
-    taiex_chg = market_summary.get("加權指數漲跌")
-    taiex_pct = market_summary.get("加權指數漲跌_%")
-    taiex_str = f"{taiex:,.2f}" if taiex is not None else "—"
-    taiex_chg_str = (f"({taiex_chg:+,.2f} / {taiex_pct:+.2f}%)"
-                     if taiex_chg is not None else "")
-    foreign_total = market_summary.get("外資合計淨買_張")
-    foreign_str = f"{foreign_total:+,.0f} 張" if foreign_total is not None else "—"
+    taiex_str, taiex_chg_str = format_taiex(market_summary)
+    taiex_str = taiex_str or "—"
+    taiex_chg_str = f"({taiex_chg_str})" if taiex_chg_str else ""
+    foreign_str = format_foreign_total(market_summary) or "—"
 
     header = f"""# 台灣股市選股報告 — {today}
 

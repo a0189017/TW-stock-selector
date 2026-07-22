@@ -2,6 +2,7 @@
 import pandas as pd
 
 from analysis.common import exclude_etfs
+from config import PRICE_MIN, HOT_STOCK_PRICE_MAX, HOT_STOCK_MIN_TRADE_VALUE
 
 
 def compute_hot_sectors(universe_df: pd.DataFrame,
@@ -82,8 +83,8 @@ def compute_hot_stocks(universe_df: pd.DataFrame,
         return []
 
     df = exclude_etfs(universe_df.copy())
-    df = df[(df["close"] >= 10) & (df["close"] <= 2000)]
-    df = df[df["trade_value"] >= 5e7]  # 5,000萬以上成交額才算流動性夠
+    df = df[(df["close"] >= PRICE_MIN) & (df["close"] <= HOT_STOCK_PRICE_MAX)]
+    df = df[df["trade_value"] >= HOT_STOCK_MIN_TRADE_VALUE]
 
     if not chip_df.empty and "code" in chip_df.columns:
         chip = chip_df[["code", "foreign_net_today", "trust_net_today",

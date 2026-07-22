@@ -8,9 +8,8 @@ Data availability by time (Taiwan time):
 import time
 import requests
 import pandas as pd
-from datetime import datetime
 from data.cache import cache_get, cache_set, make_key
-from config import TWSE_OPENAPI, TWSE_RWD, TPEX_OPENAPI, FINMIND_API, REQUEST_TIMEOUT, CACHE_TTL_SECONDS, clean_number, get_recent_weekdays
+from config import TWSE_OPENAPI, TWSE_RWD, TPEX_OPENAPI, FINMIND_API, REQUEST_TIMEOUT, CACHE_TTL_SECONDS, clean_number, get_recent_weekdays, taipei_now
 from log import get_logger
 
 logger = get_logger()
@@ -24,20 +23,14 @@ _LAST_CACHE_TTL = 7 * 24 * 3600
 
 
 def _fetch_json(url: str, params: dict = None, retries: int = 2) -> list | dict | None:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT,
-                             headers={"User-Agent": "Mozilla/5.0"}, verify=False)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(1)
-            else:
-                logger.warning("universe fetch failed (%s): %s", url, e)
-    return None
+    from data.http import get_json
+    return get_json(url, params=params, retries=retries, label="universe")
+
+
+def _fetch_text(url: str, params: dict = None, retries: int = 2) -> str | None:
+    """GET decoded text (for endpoints that return CSV, not JSON)."""
+    from data.http import get_text
+    return get_text(url, params=params, retries=retries, label="universe")
 
 
 # ---------------------------------------------------------------------------
@@ -77,15 +70,62 @@ def _parse_twse_openapi(data: list) -> list[dict]:
     return rows
 
 
+def _parse_twse_rwd_csv(text: str) -> list[dict]:
+    """Parse TWSE RWD afterTrading/STOCK_DAY_ALL CSV response.
+
+    The RWD endpoint now returns CSV (header row of Chinese column names + quoted
+    data rows) regardless of response=json — the old JSON `stat/fields/data` shape
+    is gone, so _parse_twse_rwd(dict) never matched. This parses the CSV form.
+    """
+    import csv as _csv
+    import io as _io
+    if not text:
+        return []
+    reader = list(_csv.reader(_io.StringIO(text)))
+    # Find the header row containing the known column names.
+    header_idx = next((i for i, r in enumerate(reader) if "證券代號" in r and "收盤價" in r), -1)
+    if header_idx < 0:
+        return []
+    fields = reader[header_idx]
+    records = [r for r in reader[header_idx + 1:] if r]
+    return _rwd_rows_from(fields, records)
+
+
+def _rwd_csv_date(text: str) -> str:
+    """Extract the actual data date (Gregorian YYYYMMDD) from an RWD CSV payload.
+
+    RWD returns the latest published trading day regardless of the requested
+    `date` (during session it's yesterday), so read the ROC 日期 column."""
+    import csv as _csv
+    import io as _io
+    if not text:
+        return ""
+    reader = list(_csv.reader(_io.StringIO(text)))
+    header_idx = next((i for i, r in enumerate(reader) if "證券代號" in r), -1)
+    if header_idx < 0:
+        return ""
+    fields = reader[header_idx]
+    date_i = next((i for i, f in enumerate(fields) if "日期" in f), -1)
+    for r in reader[header_idx + 1:]:
+        if r and date_i >= 0 and len(r) > date_i:
+            return _roc_date_to_gregorian(r[date_i])
+    return ""
+
+
 def _parse_twse_rwd(data: dict) -> list[dict]:
-    """Parse TWSE RWD afterTrading/STOCK_DAY_ALL response."""
-    rows = []
+    """Parse the legacy TWSE RWD JSON response (kept for backward compatibility)."""
     if not data or data.get("stat") != "OK":
-        return rows
+        return []
     fields = data.get("fields", [])
     records = data.get("data", [])
     if not fields or not records:
-        return rows
+        return []
+    return _rwd_rows_from(fields, records)
+
+
+def _rwd_rows_from(fields: list, records: list) -> list[dict]:
+    """Shared row builder for RWD JSON and CSV, keyed by Chinese column names."""
+    rows = []
 
     def idx(name: str) -> int:
         for i, f in enumerate(fields):
@@ -160,7 +200,7 @@ def fetch_twse_universe() -> pd.DataFrame:
       3. RWD for previous trading days → for non-trading days / weekends
       4. last-known-good cache → absolute fallback
     """
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("twse_universe", today)
     cached = cache_get(key)
     if cached is not None:
@@ -169,43 +209,63 @@ def fetch_twse_universe() -> pd.DataFrame:
     rows = []
     data_date = ""
 
-    # 1) Try RWD with today's date first — most accurate once data is published
-    rwd_today = _fetch_json(
+    # 1) Try RWD first — it now returns CSV of the latest published trading day.
+    rwd_text = _fetch_text(
         f"{TWSE_RWD}/afterTrading/STOCK_DAY_ALL",
         params={"date": today, "response": "json"},
     )
-    rows = _parse_twse_rwd(rwd_today or {})
+    rows = _parse_twse_rwd_csv(rwd_text or "")
     if len(rows) >= _MIN_STOCKS:
-        data_date = today
+        data_date = _rwd_csv_date(rwd_text) or today
 
-    # 2) Try OpenAPI if RWD today is empty (data not published yet)
+    # 2) Try OpenAPI if RWD today is empty (data not published yet).
+    #    Preserve whatever OpenAPI returns as a fallback even when it is a
+    #    previous trading day — a stale-but-complete dataset beats an empty
+    #    universe. (Previously a non-today OpenAPI payload was discarded
+    #    outright, which silently emptied the whole TWSE list.)
+    openapi_rows: list = []
+    openapi_date = ""
     if len(rows) < _MIN_STOCKS:
         openapi_data = _fetch_json(f"{TWSE_OPENAPI}/exchangeReport/STOCK_DAY_ALL")
-        rows = _parse_twse_openapi(openapi_data or [])
-        # Check if OpenAPI data is actually today's or stale (yesterday's)
-        if rows and openapi_data:
-            first_date = _roc_date_to_gregorian(openapi_data[0].get("Date", ""))
-            data_date = first_date
-            if first_date and first_date != today:
-                # OpenAPI still serving a previous day — try RWD for recent days
-                rows = []
+        parsed = _parse_twse_openapi(openapi_data or [])
+        if parsed and openapi_data:
+            openapi_date = _roc_date_to_gregorian(openapi_data[0].get("Date", ""))
+            if openapi_date == today:
+                rows = parsed
+                data_date = openapi_date
+            else:
+                # Previous day — keep as fallback, try RWD recent days for fresher.
+                openapi_rows = parsed
 
-    # 3) Try RWD for recent trading days (skip today — already tried above)
+    # 3) Try RWD for recent trading days, but ONLY dates newer than the OpenAPI
+    #    payload we already hold (and skip today — tried above). The point of
+    #    this loop is to beat OpenAPI's freshness; fetching dates <= openapi_date
+    #    can never do that. This matters when the RWD endpoint is down: each miss
+    #    blocks ~20s on a read timeout, so without this guard a stale-OpenAPI day
+    #    burned ~120s re-fetching older data it could never use.
     if len(rows) < _MIN_STOCKS:
         for date in get_recent_weekdays(7):
             if date == today:
                 continue
-            rwd = _fetch_json(
+            if openapi_date and date <= openapi_date:
+                continue
+            rwd_text = _fetch_text(
                 f"{TWSE_RWD}/afterTrading/STOCK_DAY_ALL",
                 params={"date": date, "response": "json"},
             )
-            rows = _parse_twse_rwd(rwd or {})
-            if len(rows) >= _MIN_STOCKS:
-                data_date = date
+            parsed = _parse_twse_rwd_csv(rwd_text or "")
+            if len(parsed) >= _MIN_STOCKS:
+                rows = parsed
+                data_date = _rwd_csv_date(rwd_text) or date
                 break
             time.sleep(0.4)
 
-    # 4) last-known-good fallback
+    # 4) Fall back to the preserved OpenAPI dataset (stale but complete)
+    if len(rows) < _MIN_STOCKS and len(openapi_rows) >= _MIN_STOCKS:
+        rows = openapi_rows
+        data_date = openapi_date
+
+    # 5) last-known-good cache fallback
     if len(rows) < _MIN_STOCKS:
         last = cache_get(_TWSE_LAST_KEY)
         if last:
@@ -302,7 +362,7 @@ def _parse_tpex_rwd(data: dict) -> list[dict]:
 
 def fetch_tpex_universe() -> pd.DataFrame:
     """Fetch all TPEX stocks. Falls back to previous trading day if today unavailable."""
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("tpex_universe", today)
     cached = cache_get(key)
     if cached is not None:
@@ -349,7 +409,7 @@ def fetch_tpex_universe() -> pd.DataFrame:
 
 def fetch_twse_pe() -> dict:
     """Fetch TWSE P/E, PB, dividend yield."""
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("twse_pe", today)
     cached = cache_get(key)
     if cached is not None:
@@ -407,6 +467,17 @@ def fetch_universe() -> pd.DataFrame:
     if twse_df.empty and tpex_df.empty:
         raise RuntimeError("無法取得股票清單，請確認網路連線後再試")
 
+    # A half-failure (one whole exchange missing) still produces a non-empty
+    # universe, so it used to pass silently — e.g. TPEX-only with no TWSE stocks.
+    # Surface it loudly so callers know the universe is incomplete.
+    missing = []
+    if twse_df.empty:
+        missing.append("TWSE(上市)")
+    if tpex_df.empty:
+        missing.append("TPEX(上櫃)")
+    if missing:
+        logger.warning("universe half-failure: missing exchange(s) %s", missing)
+
     parts = [df for df in [twse_df, tpex_df] if not df.empty]
     df = pd.concat(parts, ignore_index=True)
 
@@ -417,6 +488,8 @@ def fetch_universe() -> pd.DataFrame:
     industry_map = fetch_industry_map()
     df["industry"] = df["code"].map(lambda c: industry_map.get(c, "其他"))
 
+    # Attach a visible marker consumed by fetch_market_summary.
+    df.attrs["missing_exchanges"] = missing
     return df
 
 
@@ -425,15 +498,20 @@ def fetch_market_summary(universe_df: pd.DataFrame) -> dict:
     if universe_df.empty:
         return {}
 
-    twse = universe_df[universe_df["exchange"] == "TWSE"]
-    up = int((twse["change"] > 0).sum())
-    down = int((twse["change"] < 0).sum())
-    flat = int((twse["change"] == 0).sum())
-    total_value_b = round(twse["trade_value"].sum() / 1e8, 1)
+    # Breadth over the WHOLE market (TWSE + TPEX), ETFs excluded — same universe
+    # as analysis.market_hot, so the totals reconcile with 強勢族群. Previously
+    # this counted only the TWSE subset, so a missing/empty TWSE (or a TPEX-only
+    # universe) collapsed every figure to 0 even though per-industry data existed.
+    from analysis.common import exclude_etfs
+    market = exclude_etfs(universe_df.copy())
+    up = int((market["change"] > 0).sum())
+    down = int((market["change"] < 0).sum())
+    flat = int((market["change"] == 0).sum())
+    total_value_b = round(market["trade_value"].sum() / 1e8, 1)
 
     # Canonical 大盤概況 — raw values, Chinese keys. taiex/外資合計 are filled in
     # later by the pipeline once history/chip data is available; default to None.
-    return {
+    summary = {
         "上漲家數": up,
         "下跌家數": down,
         "持平家數": flat,
@@ -443,3 +521,10 @@ def fetch_market_summary(universe_df: pd.DataFrame) -> dict:
         "加權指數漲跌_%": None,
         "外資合計淨買_張": None,
     }
+
+    # Surface an incomplete-universe warning when a whole exchange is missing.
+    missing = universe_df.attrs.get("missing_exchanges") or []
+    if missing:
+        summary["資料警示"] = f"缺少交易所資料:{'、'.join(missing)},以下統計不完整"
+
+    return summary

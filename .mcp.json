@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "stock-selector": {
+      "type": "stdio",
+      "command": "C:\\Users\\a0189\\Desktop\\TW-stock-selector\\venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\a0189\\Desktop\\TW-stock-selector\\mcp_server.py"
+      ],
+      "env": {},
+      "timeout": 3600000
+    }
+  }
+}

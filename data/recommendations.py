@@ -9,6 +9,7 @@ score bucket, giving an honest hit-rate / edge readout.
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+from config import taipei_now
 
 from log import get_logger
 
@@ -40,7 +41,7 @@ def save_screening(candidates: list[dict], date: str | None = None) -> int:
     """Persist the day's screened candidates. Idempotent per (date, code)."""
     if not candidates:
         return 0
-    date = date or datetime.today().strftime("%Y-%m-%d")
+    date = date or taipei_now().strftime("%Y-%m-%d")
     rows = []
     for rank, c in enumerate(candidates, start=1):
         code = str(c.get("code") or c.get("代號") or "").strip()
@@ -86,7 +87,9 @@ def evaluate_performance(horizon: int = 10, min_age_days: int = 14) -> dict:
     if not records:
         return {"message": "尚無推薦歷史資料，先執行幾天選股後再評估。"}
 
-    today = datetime.today()
+    # Naive (tz-less) Taipei date — `date` strings from the DB are naive too,
+    # and subtracting an aware taipei_now() from a naive strptime() raises.
+    today = taipei_now().replace(tzinfo=None)
     # Only evaluate screenings old enough for the horizon to have elapsed.
     eligible = []
     for date, code, exchange, close, score in records:
@@ -102,8 +105,10 @@ def evaluate_performance(horizon: int = 10, min_age_days: int = 14) -> dict:
 
     from data.fetcher_history import fetch_history
     uniq = {(c, e or "TWSE") for _, c, e, _, _ in eligible}
+    # Use the shared daily cache (was bypass_cache=True → cold-downloaded every
+    # call). Historical screens are the same 1y bars the screener already caches.
     history = fetch_history([{"code": c, "exchange": e} for c, e in uniq],
-                            bypass_cache=True, include_taiex=False)
+                            bypass_cache=False, include_taiex=False)
 
     buckets: dict[str, list[float]] = {"高分(≥55)": [], "中分(45-54)": [], "低分(<45)": []}
     detail = []

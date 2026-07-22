@@ -1,8 +1,9 @@
 """Build Claude prompts for the 股癌-style analyst."""
 import json
-from datetime import datetime
 
-from analysis.common import serialize_tech, serialize_chip, serialize_fundamental
+from analysis.common import (serialize_tech, serialize_chip, serialize_fundamental,
+                            format_taiex, format_foreign_total)
+from config import taipei_now
 
 
 SYSTEM_PROMPT = """你是一位擁有超過15年台股實戰經驗的選股達人。你的分析風格精準、直白，每句話都有料，不說廢話。
@@ -47,7 +48,7 @@ SYSTEM_PROMPT = """你是一位擁有超過15年台股實戰經驗的選股達�
 
 
 def build_user_prompt(candidates: list[dict], market_summary: dict) -> str:
-    today = datetime.today().strftime("%Y-%m-%d")
+    today = taipei_now().strftime("%Y-%m-%d")
 
     stocks_data = []
     for s in candidates:
@@ -95,14 +96,10 @@ def build_user_prompt(candidates: list[dict], market_summary: dict) -> str:
         hot_stocks_text = "  （資料不足）"
 
     # Market summary numbers are now raw — format them here for the prompt text.
-    taiex = market_summary.get("加權指數")
-    taiex_chg = market_summary.get("加權指數漲跌")
-    taiex_pct = market_summary.get("加權指數漲跌_%")
-    taiex_str = f"{taiex:,.2f}" if taiex is not None else "—"
-    taiex_chg_str = (f"{taiex_chg:+,.2f} / {taiex_pct:+.2f}%"
-                     if taiex_chg is not None else "—")
-    foreign_total = market_summary.get("外資合計淨買_張")
-    foreign_str = f"{foreign_total:+,.0f} 張" if foreign_total is not None else "—"
+    taiex_str, taiex_chg_str = format_taiex(market_summary)
+    taiex_str = taiex_str or "—"
+    taiex_chg_str = taiex_chg_str or "—"
+    foreign_str = format_foreign_total(market_summary) or "—"
 
     prompt = f"""今天是 {today}，以下是經過三階段篩選後的 {len(candidates)} 檔候選股票。
 

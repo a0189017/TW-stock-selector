@@ -1,7 +1,8 @@
 """Persistent portfolio management — add, remove, list holdings."""
 import json
 from pathlib import Path
-from datetime import datetime
+
+from config import taipei_now
 
 PORTFOLIO_FILE = Path(__file__).parent / "portfolio.json"
 
@@ -26,7 +27,7 @@ def add_holding(code: str, shares: float, cost: float, name: str = "") -> dict:
     """Add or update a holding. shares = 張數, cost = 成本均價 (TWD)."""
     code = code.strip()
     holdings = load_portfolio()
-    today = datetime.today().strftime("%Y-%m-%d")
+    today = taipei_now().strftime("%Y-%m-%d")
 
     for h in holdings:
         if h["code"] == code:
@@ -207,7 +208,6 @@ def run_health_check() -> dict:
         tech_map[code] = ind
 
     # ---- Assemble results ----
-    from datetime import datetime
     total_cost_twd = 0.0
     total_value_twd = 0.0
     results = []
@@ -276,7 +276,7 @@ def run_health_check() -> dict:
 
     return {
         "格式版本": SCHEMA_VERSION,
-        "資料日期": datetime.today().strftime("%Y-%m-%d"),
+        "資料日期": taipei_now().strftime("%Y-%m-%d"),
         "持股概況": {
             "持股檔數": len(results),
             "總持有成本_元": round(total_cost_twd),

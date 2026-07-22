@@ -3,7 +3,7 @@ import pandas as pd
 
 from config import (VOLUME_MIN_VALUE_TWD, PRICE_MIN, PRICE_MAX,
                     CHIP_SIGNAL_MIN, STAGE3_MIN_SCORE, STAGE3_TOP_N)
-from analysis.common import exclude_etfs, extract_indicators
+from analysis.common import exclude_etfs, extract_indicators, price_divergence_signal, make_ticker
 from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
 
 
@@ -35,22 +35,34 @@ def stage1_liquidity(universe_df: pd.DataFrame,
     return df.reset_index(drop=True)
 
 
+def select_liquid_pool(universe_df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """
+    Liquidity-filtered pool of the n most-actively-traded stocks, CHIP-BLIND.
+
+    Reuses stage1_liquidity (ETF exclusion, price range, min trade value) then
+    keeps the top n by trade_value. Used by the 回測名單 and 飆股 screens, which
+    rank by technical/momentum score and must NOT be pre-filtered by chip data.
+    """
+    df = stage1_liquidity(universe_df)
+    if df.empty:
+        return df
+    return df.sort_values("trade_value", ascending=False).head(n).reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Stage 2: Chip signal filter (instant, using today's chip data)
 # ---------------------------------------------------------------------------
 
-def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
+def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame,
+                apply_filter: bool = True) -> pd.DataFrame:
     """
     Require a stock to show at least CHIP_SIGNAL_MIN bullish chip signals.
-    Returns filtered DataFrame with chip columns attached.
+    Returns a DataFrame with chip columns ALWAYS attached (so downstream
+    serialize_chip reports real values / honest nulls, never missing keys).
+
+    apply_filter=False attaches chip columns but skips the signal filter — used
+    by the pipeline's degraded fallback so it never emits null-chip candidates.
     """
-    if chip_df.empty:
-        return stage1_df
-
-    chip = chip_df.set_index("code") if "code" in chip_df.columns else chip_df
-
-    # Attach chip data
-    df = stage1_df.copy()
     chip_cols = (
         "foreign_net_today", "trust_net_today", "big3_net_today",
         "foreign_net_5d", "trust_net_5d",
@@ -58,6 +70,19 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
         "short_today", "short_change_pct", "short_margin_ratio",
         "foreign_consec_buy", "foreign_consec_sell",
     )
+
+    df = stage1_df.copy()
+
+    # No chip data at all: attach empty columns (None → serialized as null, an
+    # honest "no data") and skip filtering — signals can't be evaluated.
+    if chip_df.empty:
+        for col in chip_cols:
+            df[col] = None
+        return df.reset_index(drop=True)
+
+    chip = chip_df.set_index("code") if "code" in chip_df.columns else chip_df
+
+    # Attach chip data
     for col in chip_cols:
         df[col] = df["code"].map(chip[col] if col in chip.columns else {}).fillna(0)
 
@@ -80,7 +105,8 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
         return signals
 
     df["chip_signals"] = df.apply(chip_signals, axis=1)
-    df = df[df["chip_signals"] >= CHIP_SIGNAL_MIN]
+    if apply_filter:
+        df = df[df["chip_signals"] >= CHIP_SIGNAL_MIN]
     return df.reset_index(drop=True)
 
 
@@ -103,8 +129,7 @@ def stage3_technical(stage2_df: pd.DataFrame,
     for _, stock in stage2_df.iterrows():
         code = stock["code"]
         exchange = stock["exchange"]
-        suffix = ".TW" if exchange == "TWSE" else ".TWO"
-        ticker = f"{code}{suffix}"
+        ticker = make_ticker(code, exchange)
 
         df_hist = history.get(ticker)
         if df_hist is None or len(df_hist) < 60:
@@ -123,13 +148,9 @@ def stage3_technical(stage2_df: pd.DataFrame,
         # Price-source reconciliation: universe close is the official close;
         # yfinance close drives the indicators. Flag large divergences so the
         # analyst knows the technical readout may be on a different print.
-        official_close = float(stock.get("close", 0) or 0)
-        yf_close = ind.get("yf_close", 0)
-        if official_close > 0 and yf_close > 0:
-            diff_pct = abs(yf_close - official_close) / official_close * 100
-            if diff_pct > 2:
-                tech_signals = list(tech_signals) + [
-                    f"⚠官方收盤{official_close}與yfinance{yf_close}背離{diff_pct:.1f}%"]
+        divergence = price_divergence_signal(stock.get("close", 0), ind.get("yf_close", 0))
+        if divergence:
+            tech_signals = list(tech_signals) + [divergence]
 
         row = stock.to_dict()
         row.update(ind)

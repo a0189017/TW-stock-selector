@@ -109,6 +109,9 @@ pytest
 | 工具 | 說明 |
 |------|------|
 | `fetch_stock_candidates` | 執行三階段篩選，回傳最多 80 支候選，請 Claude 選出今日 10 檔 |
+| `fetch_backtest_picks` | 回測名單：純依技術評分（score_stock）排序取前 10，**跳過籌碼篩選**，避免高分股被埋掉 |
+| `fetch_momentum_stocks` | 飆股名單：純動能排序（漲停 / 爆量 / 高 RS / 均線多頭突破 / 連紅），不罰超買；支援盤中 |
+| `fetch_hot_sectors` | 盤中族群推薦：以 TWSE MIS 即時報價計算全市場各產業強弱，回傳最強族群與領頭個股 |
 | `check_portfolio` | 對持股進行健檢，分析技術面與籌碼面，給出續抱 / 停損建議 |
 | `analyze_stock` | 深度分析單一個股（輸入 4 碼代號） |
 | `add_holding` | 新增持股（代號、張數、成本價） |

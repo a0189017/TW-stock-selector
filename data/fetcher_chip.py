@@ -3,23 +3,15 @@ import time
 import requests
 import pandas as pd
 from data.cache import cache_get, cache_set, make_key
-from config import TWSE_RWD, TWSE_OPENAPI, TPEX_OPENAPI, REQUEST_TIMEOUT, REQUEST_DELAY, clean_number, get_recent_weekdays
+from config import TWSE_RWD, TWSE_OPENAPI, TPEX_OPENAPI, REQUEST_TIMEOUT, REQUEST_DELAY, clean_number, get_recent_weekdays, taipei_now
 from log import get_logger
 
 logger = get_logger()
 
 
 def _get(url: str, params: dict = None) -> dict | list | None:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    try:
-        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT,
-                         headers={"User-Agent": "Mozilla/5.0"}, verify=False)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.warning("chip fetch failed (%s): %s", url, e)
-        return None
+    from data.http import get_json
+    return get_json(url, params=params, label="chip")
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +71,34 @@ def _parse_t86(data: dict) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def _compute_consec_streaks(combined: pd.DataFrame) -> tuple[dict, dict]:
+    """
+    For each stock, count consecutive 外資 buy/sell days working backwards from
+    the most recent date in `combined` (columns: code, date, foreign_net).
+    Returns ({code: buy_streak}, {code: sell_streak}) — a stock has at most one
+    non-zero streak (a zero-net day, or a flip in direction, ends counting).
+    """
+    consec_buy: dict = {}
+    consec_sell: dict = {}
+    for code, grp in combined.groupby("code"):
+        grp_sorted = grp.sort_values("date", ascending=False)
+        buy_streak = sell_streak = 0
+        for net in grp_sorted["foreign_net"]:
+            if net > 0:
+                if sell_streak > 0:
+                    break
+                buy_streak += 1
+            elif net < 0:
+                if buy_streak > 0:
+                    break
+                sell_streak += 1
+            else:
+                break
+        consec_buy[code] = buy_streak
+        consec_sell[code] = sell_streak
+    return consec_buy, consec_sell
+
+
 def fetch_twse_institutional(dates: list[str]) -> pd.DataFrame:
     """Fetch TWSE T86 for given dates. Returns DataFrame with 5-day aggregates per stock."""
     all_dfs = []
@@ -126,31 +146,7 @@ def fetch_twse_institutional(dates: list[str]) -> pd.DataFrame:
     result = agg.join(today_df, how="left").reset_index()
 
     # --- 外資連續買超/賣超天數 ---
-    # For each stock, count consecutive buy/sell days from the most recent date backwards.
-    consec_buy = {}
-    consec_sell = {}
-    for code, grp in combined.groupby("code"):
-        grp_sorted = grp.sort_values("date", ascending=False)
-        buy_streak = sell_streak = 0
-        for net in grp_sorted["foreign_net"]:
-            if net > 0:
-                if buy_streak == 0 and sell_streak == 0:
-                    buy_streak += 1
-                elif buy_streak > 0:
-                    buy_streak += 1
-                else:
-                    break
-            elif net < 0:
-                if sell_streak == 0 and buy_streak == 0:
-                    sell_streak += 1
-                elif sell_streak > 0:
-                    sell_streak += 1
-                else:
-                    break
-            else:
-                break
-        consec_buy[code] = buy_streak
-        consec_sell[code] = sell_streak
+    consec_buy, consec_sell = _compute_consec_streaks(combined)
 
     result["foreign_consec_buy"] = result["code"].map(consec_buy).fillna(0).astype(int)
     result["foreign_consec_sell"] = result["code"].map(consec_sell).fillna(0).astype(int)
@@ -164,8 +160,7 @@ def fetch_twse_institutional(dates: list[str]) -> pd.DataFrame:
 
 def fetch_twse_margin() -> pd.DataFrame:
     """Fetch TWSE margin balance (today vs yesterday) from OpenAPI."""
-    from datetime import datetime
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("mi_margn", today)
     cached = cache_get(key)
     if cached is not None:
@@ -229,8 +224,7 @@ def fetch_twse_margin() -> pd.DataFrame:
 
 def fetch_tpex_institutional() -> pd.DataFrame:
     """Fetch TPEX today's institutional net buy/sell."""
-    from datetime import datetime
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("tpex_3insti", today)
     cached = cache_get(key)
     if cached is not None:
@@ -240,18 +234,30 @@ def fetch_tpex_institutional() -> pd.DataFrame:
     if not data:
         return pd.DataFrame()
 
+    # The TPEX OpenAPI ships verbose English column names with inconsistent
+    # spacing (e.g. "ForeignInvestorsInclude MainlandAreaInvestors-Difference").
+    # Match by whitespace-stripped, lower-cased keys so a stray space can't
+    # silently zero out the value (the previous guessed keys never matched).
+    def _pick(item: dict, *normalized_targets: str) -> float:
+        norm = {"".join(str(k).split()).lower(): v for k, v in item.items()}
+        for t in normalized_targets:
+            if t in norm:
+                return clean_number(norm[t])
+        return 0.0
+
     rows = []
     for item in data:
         code = str(item.get("SecuritiesCompanyCode", "")).strip()
         if not (code.isdigit() and len(code) == 4):
             continue
-        # Field names may vary; try multiple keys
-        foreign = clean_number(item.get("ForeignAndMainlandChina_Diff") or
-                               item.get("Foreign_Diff") or item.get("ForeignDiff", 0))
-        trust = clean_number(item.get("InvestmentTrust_Diff") or
-                             item.get("Trust_Diff") or item.get("InvestmentTrustDiff", 0))
-        dealer = clean_number(item.get("Dealer_Diff") or item.get("DealerDiff", 0))
-        total = clean_number(item.get("TotalDiff") or item.get("Total_Diff", 0))
+        # 外資及陸資買賣超(不含外資自營商)— reconciles with TotalDifference.
+        foreign = _pick(
+            item,
+            "foreigninvestorsincludemainlandareainvestors(foreigndealersexcluded)-difference",
+        )
+        trust = _pick(item, "securitiesinvestmenttrustcompanies-difference")
+        dealer = _pick(item, "dealers-difference")
+        total = _pick(item, "totaldifference")
         if total == 0:
             total = foreign + trust + dealer
         rows.append({
@@ -259,9 +265,14 @@ def fetch_tpex_institutional() -> pd.DataFrame:
             "foreign_net_today": foreign / 1000,
             "trust_net_today": trust / 1000,
             "big3_net_today": total / 1000,
-            "foreign_net_5d": foreign / 1000,  # only today available for TPEX
-            "trust_net_5d": trust / 1000,
-            "big3_net_5d": total / 1000,
+            # TPEX OpenAPI only exposes a single trading day; there is no 5-day
+            # figure, so leave it NaN rather than passing today's value off as
+            # a 5-day total (which would mislead stage2 signals and 強勢個股).
+            # NaN (not None) keeps the concatenated column float64 so downstream
+            # .fillna(0)/.clip() stay numeric; NaN > 0 is safely False.
+            "foreign_net_5d": float("nan"),
+            "trust_net_5d": float("nan"),
+            "big3_net_5d": float("nan"),
         })
 
     df = pd.DataFrame(rows)
@@ -272,8 +283,7 @@ def fetch_tpex_institutional() -> pd.DataFrame:
 
 def fetch_tpex_margin() -> pd.DataFrame:
     """Fetch TPEX margin balance (today only, no yesterday comparison)."""
-    from datetime import datetime
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("tpex_margin", today)
     cached = cache_get(key)
     if cached is not None:

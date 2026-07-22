@@ -5,6 +5,8 @@ Centralises three things that used to be copy-pasted in 4-5 places:
   - MA-structure label (多頭排列 / 短多 / 空頭排列 / 整理)
   - flat indicator extraction + the tech / chip JSON blocks emitted to Claude
 """
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -17,6 +19,50 @@ def exclude_etfs(df: pd.DataFrame) -> pd.DataFrame:
     is_etf = (df["code"].str.startswith("00") |
               df["name"].str.contains(_ETF_NAME_PATTERN, na=False, regex=True))
     return df[~is_etf & df["code"].str.match(r"^\d{4}$")]
+
+
+def format_taiex(market_summary: dict) -> tuple[str | None, str | None]:
+    """
+    Format 加權指數/漲跌 for display. Returns (taiex_str, chg_pct_str), each None
+    when the underlying value is missing — callers choose their own fallback
+    text ("—", "", ...) since prompt_builder and report_writer differ there.
+    """
+    taiex = market_summary.get("加權指數")
+    chg = market_summary.get("加權指數漲跌")
+    pct = market_summary.get("加權指數漲跌_%")
+    taiex_str = f"{taiex:,.2f}" if taiex is not None else None
+    chg_str = f"{chg:+,.2f} / {pct:+.2f}%" if chg is not None else None
+    return taiex_str, chg_str
+
+
+def format_foreign_total(market_summary: dict) -> str | None:
+    """Format 外資合計淨買_張 for display, or None when missing."""
+    foreign_total = market_summary.get("外資合計淨買_張")
+    return f"{foreign_total:+,.0f} 張" if foreign_total is not None else None
+
+
+def make_ticker(code: str, exchange: str) -> str:
+    """yfinance ticker for a TWSE/TPEX code: '2330'+'TWSE' -> '2330.TW'."""
+    suffix = ".TW" if exchange == "TWSE" else ".TWO"
+    return f"{code}{suffix}"
+
+
+def price_divergence_signal(official_close: float, yf_close: float,
+                            threshold: float = 2.0) -> str | None:
+    """
+    Flag when the official (exchange) close and the yfinance close driving the
+    technical indicators diverge by more than `threshold`%% — i.e. the displayed
+    price and the KD/乖離/RS readout may be based on different prints. Returns
+    a warning signal string, or None when they agree (or either is missing).
+    """
+    official_close = float(official_close or 0)
+    yf_close = float(yf_close or 0)
+    if official_close <= 0 or yf_close <= 0:
+        return None
+    diff_pct = abs(yf_close - official_close) / official_close * 100
+    if diff_pct > threshold:
+        return f"⚠官方收盤{official_close}與yfinance{yf_close}背離{diff_pct:.1f}%"
+    return None
 
 
 def ma_structure_label(ma5: float, ma10: float, ma20: float, ma60: float) -> str:
@@ -69,14 +115,29 @@ def extract_indicators(df_ind: pd.DataFrame) -> dict:
 SCHEMA_VERSION = "1.0"
 
 
+def _is_num(x):
+    """True for a real (non-NaN) int/float, excluding bool."""
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and not (isinstance(x, float) and math.isnan(x)))
+
+
 def _r0(x):
-    """Round to nearest integer (張/口/家數). Pass through None/non-numeric."""
-    return round(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else x
+    """Round to nearest integer (張/口/家數). None / NaN / non-numeric → None-safe.
+
+    NaN must map to None (not crash): raw chip rows carry NaN for fields a given
+    exchange doesn't provide (e.g. TPEX foreign_net_5d), and round(NaN) raises
+    ValueError — which previously broke analyze_stock for every OTC stock.
+    """
+    if isinstance(x, float) and math.isnan(x):
+        return None
+    return round(x) if _is_num(x) else x
 
 
 def _r2(x):
-    """Round to 2 decimals (%/價). Pass through None/non-numeric."""
-    return round(x, 2) if isinstance(x, (int, float)) and not isinstance(x, bool) else x
+    """Round to 2 decimals (%/價). None / NaN / non-numeric → None-safe (see _r0)."""
+    if isinstance(x, float) and math.isnan(x):
+        return None
+    return round(x, 2) if _is_num(x) else x
 
 
 # Canonical key sets — used by tests to enforce the schema contract.

@@ -6,49 +6,22 @@ Fetch Taiwan futures data from TAIFEX:
 import io
 import csv
 import requests
-from datetime import datetime
 
 from data.cache import cache_get, cache_set, make_key
-from config import TAIFEX_OPENAPI, TAIFEX_BASE, REQUEST_TIMEOUT, clean_number
+from config import TAIFEX_OPENAPI, TAIFEX_BASE, REQUEST_TIMEOUT, clean_number, taipei_now
 from log import get_logger
 
 logger = get_logger()
 
 
 def _get(url: str, params: dict = None) -> list | dict | None:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    try:
-        r = requests.get(
-            url, params=params, timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0"}, verify=False,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.warning("futures fetch failed (%s): %s", url, e)
-        return None
+    from data.http import get_json
+    return get_json(url, params=params, label="futures")
 
 
 def _post_text(url: str, data: dict = None) -> str | None:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    try:
-        r = requests.post(
-            url, data=data, timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0"}, verify=False,
-        )
-        r.raise_for_status()
-        # TAIFEX CSV may be Big5 or UTF-8 with BOM
-        for enc in ("utf-8-sig", "utf-8", "big5"):
-            try:
-                return r.content.decode(enc)
-            except UnicodeDecodeError:
-                continue
-        return r.text
-    except Exception as e:
-        logger.warning("futures CSV fetch failed (%s): %s", url, e)
-        return None
+    from data.http import post_text
+    return post_text(url, data=data, label="futures-csv")
 
 
 # ---------------------------------------------------------------------------
@@ -60,36 +33,42 @@ def fetch_tx_close() -> float:
     Fetch 台指期近月合約收盤價 from TAIFEX OpenAPI.
     Returns 0.0 if unavailable.
     """
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("tx_close", today)
     cached = cache_get(key)
     if cached is not None:
         return float(cached)
 
-    data = _get(f"{TAIFEX_OPENAPI}/DailyMarketInfo")
+    # DailyMarketReportFut is the JSON futures report; the old DailyMarketInfo
+    # path served the Swagger HTML page (→ non-JSON → always empty 期貨概況).
+    data = _get(f"{TAIFEX_OPENAPI}/DailyMarketReportFut")
     if not data or not isinstance(data, list):
         return 0.0
 
     today_month = today[:6]  # YYYYMM
-    candidates = []
+    # {contract_month: (volume, close)} — TAIFEX lists both day and after-hours
+    # sessions per month; keep the most liquid (day-session) print per month.
+    by_month: dict[str, tuple[float, float]] = {}
     for item in data:
-        code = str(item.get("ContractCode", "")).strip().upper()
-        if code not in ("TX", "TXF", "TXFIT"):
+        if str(item.get("Contract", "")).strip().upper() != "TX":
             continue
-        month = str(item.get("ContractMonth", "")).strip()
-        if len(month) >= 6 and month[:6] >= today_month:
-            close = clean_number(
-                item.get("ClosePrice") or item.get("SettlementPrice") or 0
-            )
-            if close > 0:
-                candidates.append((month[:6], close))
+        month = str(item.get("ContractMonth(Week)", "")).strip()
+        if len(month) < 6 or month[:6] < today_month:
+            continue
+        close = clean_number(item.get("Last") or item.get("SettlementPrice") or 0)
+        if close <= 0:
+            continue
+        vol = clean_number(item.get("Volume") or 0)
+        ym = month[:6]
+        if ym not in by_month or vol > by_month[ym][0]:
+            by_month[ym] = (vol, close)
 
-    if not candidates:
+    if not by_month:
         return 0.0
 
     # Near-month = smallest contract month >= today_month
-    candidates.sort()
-    result = candidates[0][1]
+    near_month = min(by_month)
+    result = by_month[near_month][1]
     cache_set(key, result)
     return result
 
@@ -104,7 +83,7 @@ def fetch_futures_institutional() -> dict:
     Returns {"foreign_net": int, "dealer_net": int, "trust_net": int}
     or empty dict if unavailable.
     """
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("futures_insti", today)
     cached = cache_get(key)
     if cached is not None:
@@ -174,7 +153,7 @@ def fetch_futures_summary(taiex_close: float = 0.0) -> dict:
       台指期收盤, 正逆價差(點), 價差解讀,
       外資期貨淨口, 自營商期貨淨口, 外資期貨方向
     """
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     key = make_key("futures_summary", today)
     cached = cache_get(key)
     if cached is not None:

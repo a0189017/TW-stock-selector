@@ -2,18 +2,14 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from analysis.common import make_ticker as _make_ticker
 from data.cache import cache_get, cache_set, make_key
-from datetime import datetime
+from config import taipei_now
 from log import get_logger
 
 logger = get_logger()
 
 MIN_TRADING_DAYS = 60
-
-
-def _make_ticker(code: str, exchange: str) -> str:
-    suffix = ".TW" if exchange == "TWSE" else ".TWO"
-    return f"{code}{suffix}"
 
 
 def _serialize_df(df: pd.DataFrame) -> dict:
@@ -48,7 +44,7 @@ def fetch_history(
                          may not exist in the screener's candidate cache.
     bypass_cache=False → normal behaviour: read from cache, download only misses.
     """
-    today = datetime.today().strftime("%Y%m%d")
+    today = taipei_now().strftime("%Y%m%d")
     tickers = [_make_ticker(c["code"], c["exchange"]) for c in candidates]
 
     result: dict[str, pd.DataFrame] = {}
@@ -83,52 +79,56 @@ def fetch_history(
     if not missing_tickers:
         return result
 
-    # Batch download missing tickers
-    try:
-        raw = yf.download(
-            tickers=missing_tickers,
-            period="1y",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-            group_by="ticker",
-        )
-    except Exception as e:
-        logger.warning("yfinance download failed for %d tickers: %s", len(missing_tickers), e)
-        return result
-
-    if raw.empty:
-        logger.warning("yfinance returned empty for %d tickers", len(missing_tickers))
-        return result
-
-    # Unified extraction: always use MultiIndex path since yfinance 1.x always
-    # returns MultiIndex columns when group_by='ticker', even for single tickers.
-    is_multiindex = isinstance(raw.columns, pd.MultiIndex)
-
-    for ticker in missing_tickers:
+    # Download in chunks with a timeout: a batch of 150-200 tickers can stall on
+    # a single slow name and yfinance has no ceiling; chunking + timeout bounds it.
+    CHUNK = 50
+    for start in range(0, len(missing_tickers), CHUNK):
+        chunk = missing_tickers[start:start + CHUNK]
         try:
-            if is_multiindex:
-                if ticker not in raw.columns.get_level_values(0):
-                    continue
-                df = raw[ticker].copy()
-            else:
-                # Flat columns — only possible for single-ticker downloads without group_by
-                df = raw.copy()
-
-            df = df.dropna(subset=["Close"])
-            if df.empty:
-                continue
-            ohlcv_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[ohlcv_cols].copy()
-            min_rows = 5 if ticker == "^TWII" else MIN_TRADING_DAYS
-            if len(df) >= min_rows:
-                result[ticker] = df
-                if not bypass_cache:
-                    key = make_key("hist1y", ticker, today)
-                    cache_set(key, _serialize_df(df))
+            raw = yf.download(
+                tickers=chunk,
+                period="1y",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+                timeout=30,
+            )
         except Exception as e:
-            logger.debug("parse failed for %s: %s", ticker, e)
+            logger.warning("yfinance download failed for %d tickers: %s", len(chunk), e)
             continue
+
+        if raw is None or raw.empty:
+            logger.warning("yfinance returned empty for %d tickers", len(chunk))
+            continue
+
+        # yfinance 1.x returns MultiIndex columns with group_by='ticker' (even for
+        # a single ticker); flat columns only for a lone ticker without group_by.
+        is_multiindex = isinstance(raw.columns, pd.MultiIndex)
+
+        for ticker in chunk:
+            try:
+                if is_multiindex:
+                    if ticker not in raw.columns.get_level_values(0):
+                        continue
+                    df = raw[ticker].copy()
+                else:
+                    df = raw.copy()
+
+                df = df.dropna(subset=["Close"])
+                if df.empty:
+                    continue
+                ohlcv_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[ohlcv_cols].copy()
+                min_rows = 5 if ticker == "^TWII" else MIN_TRADING_DAYS
+                if len(df) >= min_rows:
+                    result[ticker] = df
+                    if not bypass_cache:
+                        key = make_key("hist1y", ticker, today)
+                        cache_set(key, _serialize_df(df))
+            except Exception as e:
+                logger.debug("parse failed for %s: %s", ticker, e)
+                continue
 
     return result
