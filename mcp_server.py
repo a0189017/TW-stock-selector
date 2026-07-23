@@ -33,7 +33,7 @@ async def list_tools() -> list[types.Tool]:
                 "回傳最多 80 支候選股票的完整技術面與籌碼面數據，以及今日大盤概況。\n\n"
                 "支援盤中模式（intraday=true）：個股收盤價會以 yfinance 即時報價覆蓋，"
                 "反映當下盤中走勢（約 15 分鐘延遲），籌碼面仍為昨日收盤後資料。\n\n"
-                "呼叫此工具取得數據後，請以資深台股投資人（股癌）風格分析，"
+                "呼叫此工具取得數據後，請以資深台股投資人風格分析，"
                 "選出今日最值得關注的 10 檔股票，每支給出：推薦理由、技術面、籌碼面、"
                 "進場策略、停損點、短期目標價，最後加上大盤觀察。"
             ),
@@ -69,7 +69,7 @@ async def list_tools() -> list[types.Tool]:
                 "對你的持股進行全面健檢。\n"
                 "回傳每支持股的：現價/損益試算、技術指標（KD/MACD/均線/乖離率）、"
                 "籌碼面（外資投信動向/融資變化）、預判建議（續抱/減碼/停損觀察）、停損參考價。\n\n"
-                "取得數據後，請以股癌風格逐一分析每支持股，給出明確操作建議。"
+                "取得數據後，請以資深台股投資人風格逐一分析每支持股，給出明確操作建議。"
                 "如果持股清單是空的，請提示用戶先用 add_holding 新增持股。"
             ),
             inputSchema={
@@ -140,7 +140,7 @@ async def list_tools() -> list[types.Tool]:
                 "針對單一個股做深度分析，不限定必須在推薦名單內。\n"
                 "輸入台股 4 碼代號，回傳：技術面（KD/MACD/均線結構/乖離率/量比）、"
                 "籌碼面（外資投信動向/融資變化）、近 10 日 K 線數據，以及技術評分與信號。\n\n"
-                "取得數據後，請以股癌風格分析這支股票的當前位置與籌碼動態，"
+                "取得數據後，請以資深台股投資人風格分析這支股票的當前位置與籌碼動態，"
                 "給出：目前技術面判讀、籌碼面觀察、近期支撐壓力、"
                 "操作建議（進場/觀望/避開）、合理停損點、短期目標價。"
             ),
@@ -196,7 +196,7 @@ async def list_tools() -> list[types.Tool]:
                 "用途：主選股（fetch_stock_candidates）會因籌碼篩選 / 配額 / top-N 裁切，"
                 "把某些技術面很強的股票在進入推薦前就排除；此工具讓這些高分股不被埋掉，"
                 "提供一份獨立的量化技術名單。籌碼欄位僅供參考，不參與排序。\n\n"
-                "取得數據後，請以股癌風格解讀這份純技術名單，並點出哪些是主選股沒選到、"
+                "取得數據後，請以資深台股投資人風格解讀這份純技術名單，並點出哪些是主選股沒選到、"
                 "但技術面值得關注的標的；每檔給進場策略、停損點、短期目標價。"
             ),
             inputSchema={
@@ -225,7 +225,7 @@ async def list_tools() -> list[types.Tool]:
                 "此工具用獨立的純動能評分，**不罰超買**，追的就是強勢動能。\n\n"
                 "支援盤中模式（intraday=true）：以 TWSE MIS 即時報價計算當下漲跌幅，"
                 "適合盤中抓正在噴的標的。\n\n"
-                "取得數據後，請以股癌風格點出今日最強的飆股、它們的動能來源與風險（追高風險），"
+                "取得數據後，請以資深台股投資人風格點出今日最強的飆股、它們的動能來源與風險（追高風險），"
                 "每檔給進場策略、停損點、短期目標價。"
             ),
             inputSchema={
@@ -257,7 +257,7 @@ async def list_tools() -> list[types.Tool]:
                 "（上漲率、平均漲幅、成交值），回傳最強勢的族群與族群內強勢個股。\n\n"
                 "預設盤中模式（intraday=true）；非交易時段或 MIS 取得失敗時，"
                 "自動改用收盤資料並標註。籌碼面仍為昨日收盤後資料。\n\n"
-                "取得數據後，請以股癌風格解讀今日資金流向哪些族群、族群輪動與"
+                "取得數據後，請以資深台股投資人風格解讀今日資金流向哪些族群、族群輪動與"
                 "族群內的領頭羊，給出操作方向。"
             ),
             inputSchema={
@@ -748,23 +748,37 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
         candidates_info = s2.head(limit)[["code", "exchange"]].to_dict("records")
         history = fetch_history(candidates_info)
 
-        # Update TAIEX
-        taiex_df = history.get("^TWII")
-        if taiex_df is not None and not taiex_df.empty:
-            closes = taiex_df["Close"].dropna()
-            if len(closes) >= 2:
-                last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
-                chg = last - prev
-                pct = chg / prev * 100
-                market_summary["加權指數"] = round(last, 2)
-                market_summary["加權指數漲跌"] = round(chg, 2)
-                market_summary["加權指數漲跌_%"] = round(pct, 2)
+        # Update TAIEX — prefer live TWSE MIS (data/fetcher_snapshot.py) over
+        # yfinance's ^TWII history, which has been observed to stop updating
+        # for multiple days at a time and would silently show a stale index
+        # (and poison the futures basis calc below, which depends on it).
+        from data.fetcher_snapshot import fetch_taiex_live
+        taiex_live = fetch_taiex_live()
+        taiex_close = None
+        if taiex_live:
+            market_summary["加權指數"] = taiex_live["price"]
+            market_summary["加權指數漲跌"] = taiex_live["change"]
+            market_summary["加權指數漲跌_%"] = taiex_live["change_pct"]
+            taiex_close = taiex_live["price"]
+        else:
+            taiex_df = history.get("^TWII")
+            if taiex_df is not None and not taiex_df.empty:
+                closes = taiex_df["Close"].dropna()
+                if len(closes) >= 2:
+                    last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+                    chg = last - prev
+                    pct = chg / prev * 100
+                    market_summary["加權指數"] = round(last, 2)
+                    market_summary["加權指數漲跌"] = round(chg, 2)
+                    market_summary["加權指數漲跌_%"] = round(pct, 2)
+                    taiex_close = last
 
-                # Futures overlay: basis + institutional positions
-                from data.fetcher_futures import fetch_futures_summary
-                futures = fetch_futures_summary(taiex_close=last)
-                if futures:
-                    market_summary["期貨概況"] = futures
+        if taiex_close:
+            # Futures overlay: basis + institutional positions
+            from data.fetcher_futures import fetch_futures_summary
+            futures = fetch_futures_summary(taiex_close=taiex_close)
+            if futures:
+                market_summary["期貨概況"] = futures
 
         # Stage 3: Technical scoring (with relative strength + monthly revenue)
         from data.fetcher_fundamental import fetch_month_revenue

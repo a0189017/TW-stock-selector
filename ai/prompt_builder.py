@@ -1,4 +1,4 @@
-"""Build Claude prompts for the 股癌-style analyst."""
+"""Build Claude prompts for the Taiwan-market analyst persona."""
 import json
 
 from analysis.common import (serialize_tech, serialize_chip, serialize_fundamental,

@@ -57,6 +57,62 @@ def _current_price(item: dict):
     return _num(item.get("y"))
 
 
+def fetch_taiex_live() -> dict | None:
+    """
+    Live 加權指數 (發行量加權股價指數) via TWSE MIS (ex_ch=tse_t00.tw).
+
+    This exists because yfinance's ^TWII feed has been observed to stop
+    updating for multiple days at a time (confirmed live: querying yfinance
+    fresh still returned a close dated two trading days earlier), silently
+    making every 加權指數/漲跌 figure — and the futures basis calculation that
+    depends on it — stale. MIS reflects the live tick and is the preferred
+    source; callers should fall back to yfinance history only if this is None.
+
+    Returns {price, prev_close, change, change_pct} or None on failure.
+    """
+    key = make_key("mis_taiex")
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        with requests.Session() as session:
+            session.headers.update(_HEADERS)
+            try:
+                session.get(f"{TWSE_MIS}/index.jsp", timeout=REQUEST_TIMEOUT, verify=certifi.where())
+            except Exception as e:
+                logger.warning("MIS cookie prime failed: %s", e)
+
+            r = session.get(
+                f"{TWSE_MIS}/api/getStockInfo.jsp",
+                params={"ex_ch": "tse_t00.tw", "json": "1", "delay": "0"},
+                timeout=REQUEST_TIMEOUT, verify=certifi.where(),
+            )
+            r.raise_for_status()
+            arr = r.json().get("msgArray", [])
+    except Exception as e:
+        logger.warning("MIS TAIEX fetch failed: %s", e)
+        return None
+
+    if not arr:
+        return None
+    item = arr[0]
+    price = _current_price(item)
+    prev = _num(item.get("y"))
+    if price is None or prev is None or prev == 0:
+        return None
+
+    change = price - prev
+    result = {
+        "price": round(price, 2),
+        "prev_close": round(prev, 2),
+        "change": round(change, 2),
+        "change_pct": round(change / prev * 100, 2),
+    }
+    cache_set(key, result, ttl=SNAPSHOT_TTL_SECONDS)
+    return result
+
+
 def fetch_market_snapshot(candidates: list[dict]) -> dict:
     """
     candidates: [{'code','exchange'}, ...].
