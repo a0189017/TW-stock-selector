@@ -31,8 +31,11 @@ async def list_tools() -> list[types.Tool]:
                 "抓取台灣股市今日選股數據。"
                 "自動執行三階段篩選（流動性 → 籌碼面 → 技術指標），"
                 "回傳最多 80 支候選股票的完整技術面與籌碼面數據，以及今日大盤概況。\n\n"
-                "支援盤中模式（intraday=true）：個股收盤價會以 yfinance 即時報價覆蓋，"
-                "反映當下盤中走勢（約 15 分鐘延遲），籌碼面仍為昨日收盤後資料。\n\n"
+                "排名採多因子綜合評分（技術面 + 籌碼強度 + 基本面 + 產業族群強度 + RS60），"
+                "不再只看技術面單一分數；可用 strategy 切換權重組合。\n\n"
+                "支援盤中模式（intraday=true）：個股收盤價與當日線型（跳空/箱型/開高走低/"
+                "開低走高/收盤位置）以 TWSE MIS 即時報價計算，技術指標（KD/乖離/量比/RS）"
+                "仍以昨日收盤 K 線計算，籌碼面仍為昨日收盤後資料。\n\n"
                 "呼叫此工具取得數據後，請以資深台股投資人風格分析，"
                 "選出今日最值得關注的 10 檔股票，每支給出：推薦理由、技術面、籌碼面、"
                 "進場策略、停損點、短期目標價，最後加上大盤觀察。"
@@ -54,10 +57,29 @@ async def list_tools() -> list[types.Tool]:
                         "type": "boolean",
                         "description": (
                             "盤中模式（預設 false）。"
-                            "設為 true 時，個股收盤價以 yfinance 即時報價（約 15 分鐘延遲）覆蓋，"
-                            "適合盤中使用。籌碼面資料仍為昨日收盤後資料。"
+                            "設為 true 時，個股收盤價與當日線型以 TWSE MIS 即時報價計算，"
+                            "適合盤中使用。技術指標與籌碼面資料仍為昨日收盤後資料。"
                         ),
                         "default": False,
+                    },
+                    "exclude_bad_shape": {
+                        "type": "boolean",
+                        "description": (
+                            "當日線型過濾（預設 false，須搭配 intraday=true 才有作用）。"
+                            "設為 true 時，排除「開高走低」或「收在當日低檔」這種當日轉弱的候選股。"
+                        ),
+                        "default": False,
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["balanced", "trend", "reversal"],
+                        "description": (
+                            "選股策略權重組合（預設 balanced）。"
+                            "balanced：技術面為主，籌碼/基本面/族群為輔，接近原本綜合表現。"
+                            "trend：加重均線趨勢、籌碼連買、族群強度、RS60，適合波段趨勢單。"
+                            "reversal：降低趨勢/族群權重，適合搭配技術面本身的超賣反彈信號操作。"
+                        ),
+                        "default": "balanced",
                     },
                 },
                 "required": [],
@@ -371,8 +393,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     # fetch_stock_candidates
     limit = min(int(arguments.get("limit", 80)), 150)
     intraday = bool(arguments.get("intraday", False))
+    exclude_bad_shape = bool(arguments.get("exclude_bad_shape", False))
+    strategy = str(arguments.get("strategy", "balanced"))
+    if strategy not in ("balanced", "trend", "reversal"):
+        strategy = "balanced"
     result_text = await loop.run_in_executor(
-        None, lambda: _run_pipeline(limit, no_cache, intraday)
+        None, lambda: _run_pipeline(limit, no_cache, intraday, exclude_bad_shape, strategy)
     )
     return [types.TextContent(type="text", text=result_text)]
 
@@ -449,6 +475,7 @@ def _run_backtest_picks(limit: int = 10, no_cache: bool = False) -> str:
                 "技術指標": serialize_tech(d),
                 "籌碼": serialize_chip(d),
                 "基本面": serialize_fundamental(d),
+                "建議價位": d.get("price_levels") or {},
             })
 
         data_date, is_today = _resolve_data_date()
@@ -485,6 +512,7 @@ def _run_momentum_stocks(limit: int = 15, no_cache: bool = False,
         from analysis.indicators import add_all_indicators, compute_relative_strength
         from analysis.common import extract_indicators, serialize_tech, SCHEMA_VERSION, make_ticker
         from analysis.momentum import score_momentum, consecutive_up_days, is_limit_up
+        from analysis.intraday_shape import classify_intraday_shape
         from config import MOMENTUM_POOL_SIZE, MOMENTUM_MIN_SCORE
 
         universe_df = fetch_universe()
@@ -526,6 +554,16 @@ def _run_momentum_stocks(limit: int = 15, no_cache: bool = False,
                 close = float(stock.get("close", 0) or 0)
 
             m_score, m_signals = score_momentum(ind, rs, change_pct, up_days)
+
+            # 當日線型 — only available intraday, since it needs today's O/H/L.
+            if code in snapshot:
+                q = snapshot[code]
+                shape_signals, shape_adj, _ = classify_intraday_shape(
+                    q.get("open"), q.get("high"), q.get("low"), q.get("price"), q.get("prev_close"))
+                if shape_signals:
+                    m_signals = m_signals + shape_signals
+                    m_score = max(0, min(100, m_score + shape_adj))
+
             tech_src = {**ind, "rs20": rs.get("rs20"), "rs_label": rs.get("rs_label")}
             rows.append({
                 "代號": code,
@@ -548,7 +586,7 @@ def _run_momentum_stocks(limit: int = 15, no_cache: bool = False,
 
         data_date, is_today = _resolve_data_date()
         if intraday and not snapshot_warn:
-            note = ("盤中即時模式（漲跌幅來自 TWSE MIS 即時報價；"
+            note = ("盤中即時模式（漲跌幅與當日線型來自 TWSE MIS 即時報價；"
                     "技術指標——量比/RS/均線結構——仍以昨日收盤 K 線計算，非即時重算）")
         elif is_today:
             note = "今日收盤資料"
@@ -682,7 +720,8 @@ def _run_screener_performance(horizon: int = 10, min_age_days: int = 14) -> str:
         return _error_json(str(e), traceback.format_exc())
 
 
-def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = False) -> str:
+def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = False,
+                  exclude_bad_shape: bool = False, strategy: str = "balanced") -> str:
     """Run the full screening pipeline and return JSON result."""
     from data.cache import set_bypass
     try:
@@ -781,9 +820,16 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
                 market_summary["期貨概況"] = futures
 
         # Stage 3: Technical scoring (with relative strength + monthly revenue)
+        # + multi-factor chip/fundamental/sector/RS60 blend, ranked by total_score
+        # (fetch_backtest_picks calls stage3_technical with none of this and keeps
+        # ranking by tech_score alone — see stage3_technical's docstring).
         from data.fetcher_fundamental import fetch_month_revenue
+        from analysis.market_hot import compute_sector_score_map
         fundamental = fetch_month_revenue(codes=s2["code"].tolist())
-        final = stage3_technical(s2, history, fundamental=fundamental)
+        sector_score_map = compute_sector_score_map(universe_df, chip_df)
+        final = stage3_technical(s2, history, fundamental=fundamental,
+                                 sector_score_map=sector_score_map,
+                                 strategy=strategy, rank_by="total_score")
 
         if final.empty:
             final = s2.head(limit)
@@ -808,10 +854,13 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
                 "收盤": d.get("close", 0),
                 "漲跌_%": d.get("change_pct", 0),
                 "技術評分": d.get("tech_score", 0),
-                "技術信號": d.get("tech_signals", []),
+                "綜合評分": d.get("total_score", d.get("tech_score", 0)),
+                "評分分項": d.get("score_breakdown", {}),
+                "技術信號": d.get("combined_signals", d.get("tech_signals", [])),
                 "技術指標": serialize_tech(d),
                 "籌碼": serialize_chip(d),
                 "基本面": serialize_fundamental(d),
+                "建議價位": d.get("price_levels") or {},
             })
 
         # ---- Intraday: patch close price + change% with TWSE MIS live quotes ----
@@ -819,25 +868,44 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
         # intraday mode. Replaces the old yfinance realtime path: MIS is faster,
         # covers both TWSE+TPEX in one batched call, and has no ~15-min delay.)
         snapshot_warn = None
+        excluded_bad_shape_count = 0
         if intraday and stocks_data:
             from data.fetcher_snapshot import fetch_market_snapshot
+            from analysis.intraday_shape import classify_intraday_shape, is_bad_shape
             rt_candidates = [{"code": s["代號"], "exchange": s["交易所"]} for s in stocks_data]
             snapshot = fetch_market_snapshot(rt_candidates)
             if snapshot:
                 for s in stocks_data:
                     q = snapshot.get(s["代號"])
-                    if q:
-                        s["收盤"] = q["price"]
-                        s["漲跌_%"] = q["change_pct"]
+                    if not q:
+                        continue
+                    s["收盤"] = q["price"]
+                    s["漲跌_%"] = q["change_pct"]
+                    # 當日線型: pure O/H/L/current arithmetic, only knowable
+                    # intraday — appended as extra signals, doesn't touch 技術評分
+                    # (that stays the EOD score the candidate was selected on).
+                    shape_signals, _shape_adj, shape_metrics = classify_intraday_shape(
+                        q.get("open"), q.get("high"), q.get("low"), q.get("price"), q.get("prev_close"))
+                    if shape_signals:
+                        s["技術信號"] = s["技術信號"] + shape_signals
+                        s["當日線型"] = shape_metrics
+
+                if exclude_bad_shape:
+                    before = len(stocks_data)
+                    stocks_data = [s for s in stocks_data
+                                  if not is_bad_shape(s.get("技術信號", []))]
+                    excluded_bad_shape_count = before - len(stocks_data)
             else:
                 snapshot_warn = "盤中即時報價(MIS)取得失敗，以下為收盤資料"
                 intraday = False
 
         data_date, is_today = _resolve_data_date()
         if intraday:
-            data_note = (f"盤中即時模式（個股報價來自 TWSE MIS 即時報價；"
+            data_note = (f"盤中即時模式（個股報價與當日線型來自 TWSE MIS 即時報價；"
                         f"技術指標——KD/乖離/量比/RS——仍以 {data_date} 收盤 K 線計算，"
                         f"與即時報價可能不同步；籌碼面為 {data_date} 收盤後資料）")
+            if exclude_bad_shape and excluded_bad_shape_count:
+                data_note += f"；已依當日線型排除 {excluded_bad_shape_count} 檔轉弱標的"
         elif is_today:
             data_note = "今日收盤資料"
         else:
@@ -862,6 +930,7 @@ def _run_pipeline(limit: int = 80, no_cache: bool = False, intraday: bool = Fals
             "格式版本": SCHEMA_VERSION,
             "資料日期": data_date,
             "資料說明": data_note,
+            "選股策略": strategy,
             "篩選結果": {
                 "全市場股票數": len(universe_df),
                 "流動性篩選後": len(s1),
@@ -976,14 +1045,25 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
             })
 
         # ---- Build output ----
-        from analysis.common import SCHEMA_VERSION, price_divergence_signal
+        from analysis.common import SCHEMA_VERSION, price_divergence_signal, divergence_confidence_discount
         current_close = info.get("close", close_price)
         # Same reconciliation stage3_technical does for the screener: 收盤 is the
         # official exchange close, but yf_close drives the indicators — flag it
-        # when they diverge so the analyst knows KD/乖離/RS may be off a different print.
+        # when they diverge so the analyst knows KD/乖離/RS may be off a different
+        # print, and discount tech_score's confidence by the same tiers.
         divergence = price_divergence_signal(current_close, close_price)
         if divergence:
             tech_signals = list(tech_signals) + [divergence]
+            discount = divergence_confidence_discount(current_close, close_price)
+            if discount < 1.0:
+                tech_score = round(tech_score * discount)
+
+        from analysis.price_levels import compute_price_levels
+        price_levels = compute_price_levels(
+            close=current_close, ma5=ind.get("ma5"), ma20=ind.get("ma20"),
+            ma60=ind.get("ma60"), atr=ind.get("atr"), bias20=ind.get("bias20"),
+            rsi=ind.get("rsi"), bb_pct=ind.get("bb_pct"),
+        )
         output = {
             "格式版本": SCHEMA_VERSION,
             "代號": code,
@@ -1000,6 +1080,7 @@ def _run_stock_analysis(code: str, no_cache: bool = False) -> str:
             "技術指標": serialize_tech(ind, full=True),
             "籌碼": serialize_chip(chip_row),
             "基本面": serialize_fundamental(fund),
+            "建議價位": price_levels or {},
             "近10日K線": recent_candles,
         }
 

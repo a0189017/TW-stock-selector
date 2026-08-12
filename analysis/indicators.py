@@ -64,6 +64,22 @@ def compute_rsi(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return rsi.rename("RSI")
 
 
+def compute_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """
+    Wilder's ATR (Average True Range) — volatility measure used to size
+    entry/stop-loss/take-profit bands (see analysis/price_levels.py) instead
+    of a flat MA or a fixed % of cost.
+    """
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+    return atr.rename("ATR")
+
+
 def compute_bollinger(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> pd.DataFrame:
     """
     Bollinger Bands (n-day SMA ± k×σ).
@@ -99,6 +115,7 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = compute_volume_ratio(df)
     df["RSI"] = compute_rsi(df)
     df = compute_bollinger(df)
+    df["ATR"] = compute_atr(df)
     return df
 
 
@@ -160,7 +177,12 @@ def score_stock(df: pd.DataFrame, rs: dict | None = None,
         v = row.get(col, np.nan)
         return float(v) if pd.notna(v) else np.nan
 
-    # --- KD (max 25pts) ---
+    # --- KD (max ~15pts) ---
+    # Weights re-calibrated 2026-08 against backtest.py --factor-analysis (see
+    # docs/factor_analysis_findings.md): "KD超賣(<30)" and "KD黃金交叉" tested
+    # with near-zero/negative 10-day forward-return effect size despite being
+    # the 2nd-highest weights in the whole formula — cut down accordingly.
+    # The k<20&d<20 "深度超賣" branch wasn't isolated in that test, left as-is.
     k, d = val(last, "K"), val(last, "D")
     pk, pd_ = val(prev, "K"), val(prev, "D")
     if not any(np.isnan([k, d, pk, pd_])):
@@ -168,18 +190,21 @@ def score_stock(df: pd.DataFrame, rs: dict | None = None,
             score += 12
             signals.append(f"KD深度超賣({k:.0f}/{d:.0f})")
         elif k < 30 and d < 30:
-            score += 8
+            score += 2  # was +8 — factor-analysis effect size -1.06pp (negative)
             signals.append(f"KD超賣({k:.0f}/{d:.0f})")
         if pk < pd_ and k >= d:
-            score += 15
+            score += 3  # was +15 — factor-analysis effect size +0.07pp (no lift)
             signals.append("KD黃金交叉")
 
-    # --- MACD (max 20pts) ---
+    # --- MACD (max ~12pts) ---
+    # "MACD柱由負轉正" was the single highest weight in score_stock (+20) but
+    # tested with a NEGATIVE forward-return effect (-0.55pp) — cut well below
+    # "MACD動能持續擴大" (+0.40pp), which now correctly outweighs it.
     hist = val(last, "MACD_hist")
     phist = val(prev, "MACD_hist")
     if not any(np.isnan([hist, phist])):
         if hist > 0 and phist <= 0:
-            score += 20
+            score += 5  # was +20 — factor-analysis effect size -0.55pp (negative)
             signals.append("MACD柱由負轉正")
         elif hist > phist > 0:
             score += 12
@@ -212,17 +237,26 @@ def score_stock(df: pd.DataFrame, rs: dict | None = None,
         score += 5
         signals.append("均線多頭排列")
 
-    # --- 乖離率 (max 10pts) ---
+    # --- 乖離率 (max ~5pts) ---
+    # "乖離健康(-3~5%)" tested as the WORST performer of all 15 measured signals
+    # (-1.87pp effect size) despite carrying the joint-highest weight — cut hard.
+    # "乖離過大(>15%)" tested as the STRONGEST positive signal (+3.65pp) in this
+    # 2-year bull-market sample, but that's kept as a risk-control penalty on
+    # purpose (追高風控原則, ai/prompt_builder.py) rather than flipped to a
+    # reward — the effect may just reflect momentum persistence specific to
+    # this backtest window, not something that holds in a down/choppy market.
+    # Only the penalty magnitude was softened (-10 → -6). Same reasoning for
+    # RSI超買 below. See docs/factor_analysis_findings.md.
     bias20 = val(last, "Bias20")
     if not np.isnan(bias20):
         if -3 <= bias20 <= 5:
-            score += 10
+            score += 2  # was +10 — factor-analysis effect size -1.87pp (worst signal)
             signals.append(f"20MA乖離健康({bias20:+.1f}%)")
         elif 5 < bias20 <= 10:
             score += 5
             signals.append(f"20MA乖離尚可({bias20:+.1f}%)")
         elif bias20 > 15:
-            score -= 10
+            score -= 6  # was -10 — softened; still a deliberate anti-chase penalty
             signals.append(f"20MA乖離過大({bias20:+.1f}%) 注意追高")
         elif bias20 < -10:
             score += 3  # deeply oversold on MA, potential bounce
@@ -254,7 +288,11 @@ def score_stock(df: pd.DataFrame, rs: dict | None = None,
             score += 8
             signals.append(f"RSI超賣({rsi:.0f})")
         elif rsi > 70:
-            score -= 8
+            # was -8 — softened to -5 for the same reason as 乖離過大 above
+            # (factor-analysis measured +2.56pp here; kept as a risk-control
+            # penalty, not flipped, per deliberate choice — see
+            # docs/factor_analysis_findings.md).
+            score -= 5
             signals.append(f"RSI超買({rsi:.0f})")
 
     # --- Bollinger Bands (max 18pts) ---
