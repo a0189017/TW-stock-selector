@@ -183,6 +183,7 @@ def run_health_check() -> dict:
     from data.fetcher_history import fetch_history
     from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
     from analysis.common import extract_indicators, serialize_chip, serialize_tech, SCHEMA_VERSION
+    from analysis.price_levels import compute_price_levels
     # Always bypass cache for history reads here: holdings may not be in the
     # screener cache, and we want the most current prices for risk assessment.
     history = fetch_history(candidates, bypass_cache=True, include_taiex=True)
@@ -241,10 +242,15 @@ def run_health_check() -> dict:
             return_pct=return_pct,
         )
 
-        # Key support / reference stop-loss
-        ma20 = tech.get("ma20", 0)
-        ma60 = tech.get("ma60", 0)
-        stop_ref = ma60 if ma60 > 0 else (cost_price * 0.92)
+        # Key support / entry-exit reference — ATR-based (analysis/price_levels.py)
+        # instead of the old flat "MA60 or cost*0.92" rule, so the band scales
+        # with each stock's own volatility instead of one fixed %.
+        price_levels = compute_price_levels(
+            close=current_price or cost_price, ma5=tech.get("ma5"), ma20=tech.get("ma20"),
+            ma60=tech.get("ma60"), atr=tech.get("atr"), bias20=tech.get("bias20"),
+            rsi=tech.get("rsi"), bb_pct=tech.get("bb_pct"),
+        )
+        stop_ref = price_levels.get("停損") if price_levels else (cost_price * 0.92)
 
         results.append({
             "代號": code,
@@ -268,7 +274,8 @@ def run_health_check() -> dict:
             "籌碼面": serialize_chip(chip),
             "預判建議": pre_rec,
             "風險提示": risk_signals,
-            "停損參考價": round(stop_ref, 1),
+            "停損參考價": round(stop_ref, 1) if stop_ref else None,
+            "建議價位": price_levels or {},
         })
 
     total_return = ((total_value_twd - total_cost_twd) / total_cost_twd * 100

@@ -10,6 +10,8 @@ import math
 import numpy as np
 import pandas as pd
 
+from config import PRICE_DIVERGENCE_PCT, PRICE_DIVERGENCE_DISCOUNT
+
 # Codes starting 00 are ETFs; names matching these are funds/bonds/REITs.
 _ETF_NAME_PATTERN = "ETF|指數|基金|債券|REITs|REIT|期信"
 
@@ -47,22 +49,47 @@ def make_ticker(code: str, exchange: str) -> str:
     return f"{code}{suffix}"
 
 
+def _divergence_pct(official_close: float, yf_close: float) -> float | None:
+    """abs %% diff between the two closes, or None when either is missing/0."""
+    official_close = float(official_close or 0)
+    yf_close = float(yf_close or 0)
+    if official_close <= 0 or yf_close <= 0:
+        return None
+    return abs(yf_close - official_close) / official_close * 100
+
+
 def price_divergence_signal(official_close: float, yf_close: float,
-                            threshold: float = 2.0) -> str | None:
+                            threshold: float = PRICE_DIVERGENCE_PCT) -> str | None:
     """
     Flag when the official (exchange) close and the yfinance close driving the
     technical indicators diverge by more than `threshold`%% — i.e. the displayed
     price and the KD/乖離/RS readout may be based on different prints. Returns
     a warning signal string, or None when they agree (or either is missing).
     """
-    official_close = float(official_close or 0)
-    yf_close = float(yf_close or 0)
-    if official_close <= 0 or yf_close <= 0:
-        return None
-    diff_pct = abs(yf_close - official_close) / official_close * 100
-    if diff_pct > threshold:
-        return f"⚠官方收盤{official_close}與yfinance{yf_close}背離{diff_pct:.1f}%"
+    diff_pct = _divergence_pct(official_close, yf_close)
+    if diff_pct is not None and diff_pct > threshold:
+        return f"⚠官方收盤{float(official_close)}與yfinance{float(yf_close)}背離{diff_pct:.1f}%"
     return None
+
+
+def divergence_confidence_discount(official_close: float, yf_close: float,
+                                   threshold: float = PRICE_DIVERGENCE_PCT) -> float:
+    """
+    Multiplier (<=1.0) to apply to tech_score when the official close and the
+    yfinance close driving KD/MACD/均線/RS diverge beyond `threshold`%% — the
+    bigger the print mismatch, the less that score should be trusted. Previously
+    this divergence only added a warning string to tech_signals; tech_score
+    itself was untouched. Returns 1.0 (no discount) when within tolerance or
+    either price is missing. See config.PRICE_DIVERGENCE_DISCOUNT for tiers.
+    """
+    diff_pct = _divergence_pct(official_close, yf_close)
+    if diff_pct is None or diff_pct <= threshold:
+        return 1.0
+    extra = diff_pct - threshold
+    for extra_min, mult in PRICE_DIVERGENCE_DISCOUNT:
+        if extra >= extra_min:
+            return mult
+    return 1.0
 
 
 def ma_structure_label(ma5: float, ma10: float, ma20: float, ma60: float) -> str:
@@ -107,6 +134,7 @@ def extract_indicators(df_ind: pd.DataFrame) -> dict:
         "ma240": round(v("MA240"), 2),
         "ma_structure": ma_structure_label(ma5, ma10, ma20, ma60),
         "yf_close": round(v("Close"), 2),
+        "atr": round(v("ATR"), 3),
     }
 
 

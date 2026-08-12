@@ -25,6 +25,17 @@ CHIP_SIGNAL_MIN = 2                  # min chip signals required for Stage 2
 STAGE3_MIN_SCORE = 35               # min technical score for Stage 3 pass
 STAGE3_TOP_N = 80                   # top N candidates sent to Claude
 
+# 官方收盤 vs yfinance 背離 (analysis/common.py::price_divergence_signal): the
+# technical indicators (KD/MACD/均線/RS) are computed on yfinance history, but
+# the displayed price is the exchange's official close — when they disagree by
+# more than this %, the indicators may be reading a different print than the
+# price shown. Also used by stage3_technical to discount tech_score's
+# confidence (PRICE_DIVERGENCE_DISCOUNT) rather than just flagging it in text.
+PRICE_DIVERGENCE_PCT = 2.0
+# tech_score multiplier tiers keyed by how far past PRICE_DIVERGENCE_PCT the
+# divergence goes — (extra %, multiplier), checked in order, first match wins.
+PRICE_DIVERGENCE_DISCOUNT = [(3.0, 0.90), (0.0, 0.95)]  # >5%→0.90x, >2%→0.95x
+
 # 強勢個股 (market_hot.compute_hot_stocks): deliberately STRICTER than the
 # general Stage-1 liquidity bar above — this ranks today's true liquid movers,
 # not just screenable candidates. Named here (not reusing PRICE_MIN/MAX /
@@ -41,6 +52,13 @@ MOMENTUM_POOL_SIZE = 200
 LIMIT_UP_PCT = 9.0                  # 漲跌幅 >= 此值視為(近)漲停/跌停
 MOMENTUM_MIN_SCORE = 20              # below this, a stock isn't meaningfully "飆" —
                                      # a thin/quiet pool shouldn't pad the list with noise
+
+# 當日線型 (analysis/intraday_shape.py): thresholds for classifying today's
+# O/H/L/current shape from MIS intraday data.
+INTRADAY_GAP_PCT = 2.0         # |open - prev_close| / prev_close >= this → 跳空
+INTRADAY_BOX_RANGE_PCT = 1.5   # (high - low) / prev_close <= this → 箱型整理
+INTRADAY_EXTREME_POS = 0.7     # open/close position in day's range >= this → 高檔
+                               # (<= 1 - this) → 低檔
 
 # Cache
 CACHE_TTL_SECONDS = 1 * 3600       # 1-hour cache TTL

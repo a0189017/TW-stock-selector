@@ -68,7 +68,9 @@ def fetch_taiex_live() -> dict | None:
     depends on it — stale. MIS reflects the live tick and is the preferred
     source; callers should fall back to yfinance history only if this is None.
 
-    Returns {price, prev_close, change, change_pct} or None on failure.
+    Returns {price, prev_close, change, change_pct, open, high, low} or None
+    on failure (open/high/low may themselves be None before the day's first
+    print establishes them).
     """
     key = make_key("mis_taiex")
     cached = cache_get(key)
@@ -103,11 +105,17 @@ def fetch_taiex_live() -> dict | None:
         return None
 
     change = price - prev
+    open_ = _num(item.get("o"))
+    high = _num(item.get("h"))
+    low = _num(item.get("l"))
     result = {
         "price": round(price, 2),
         "prev_close": round(prev, 2),
         "change": round(change, 2),
         "change_pct": round(change / prev * 100, 2),
+        "open": round(open_, 2) if open_ is not None else None,
+        "high": round(high, 2) if high is not None else None,
+        "low": round(low, 2) if low is not None else None,
     }
     cache_set(key, result, ttl=SNAPSHOT_TTL_SECONDS)
     return result
@@ -116,8 +124,10 @@ def fetch_taiex_live() -> dict | None:
 def fetch_market_snapshot(candidates: list[dict]) -> dict:
     """
     candidates: [{'code','exchange'}, ...].
-    Returns {code: {price, prev_close, change, change_pct, volume_lots}} for
-    every code MIS answered. Partial results on batch failure (logged, not raised).
+    Returns {code: {price, prev_close, change, change_pct, volume_lots,
+    open, high, low}} for every code MIS answered (open/high/low may be None
+    before the day's first print). Partial results on batch failure (logged,
+    not raised).
     """
     if not candidates:
         return {}
@@ -188,12 +198,18 @@ def _fetch_all_batches(codes: list[tuple[str, str]]) -> dict:
                     if price is None or prev is None or prev == 0:
                         continue
                     change = price - prev
+                    open_ = _num(item.get("o"))
+                    high = _num(item.get("h"))
+                    low = _num(item.get("l"))
                     result[code] = {
                         "price": round(price, 2),
                         "prev_close": round(prev, 2),
                         "change": round(change, 4),
                         "change_pct": round(change / prev * 100, 2),
                         "volume_lots": _num(item.get("v")) or 0,
+                        "open": round(open_, 2) if open_ is not None else None,
+                        "high": round(high, 2) if high is not None else None,
+                        "low": round(low, 2) if low is not None else None,
                     }
 
         return result

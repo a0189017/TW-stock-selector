@@ -306,8 +306,14 @@ def fetch_tpex_margin() -> pd.DataFrame:
         rows.append({
             "code": code,
             "margin_today": today_bal,
-            "margin_prev": today_bal,       # no prev available
-            "margin_change_pct": 0.0,
+            "margin_prev": float("nan"),    # no prev available
+            # NaN (not 0.0) — TPEX genuinely has no day-over-day comparison,
+            # which is a different thing from "we checked and it didn't move".
+            # A fabricated 0.0 was indistinguishable from a real zero-change
+            # reading downstream (analysis/multi_factor.py::compute_chip_score
+            # normalizes chip_score by which fields are actually available —
+            # see 2026-08 TPEX chip-score rebalance).
+            "margin_change_pct": float("nan"),
             "margin_util_rate": round(util_rate, 2),
         })
 

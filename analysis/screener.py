@@ -3,8 +3,12 @@ import pandas as pd
 
 from config import (VOLUME_MIN_VALUE_TWD, PRICE_MIN, PRICE_MAX,
                     CHIP_SIGNAL_MIN, STAGE3_MIN_SCORE, STAGE3_TOP_N)
-from analysis.common import exclude_etfs, extract_indicators, price_divergence_signal, make_ticker
+from analysis.common import (exclude_etfs, extract_indicators, price_divergence_signal,
+                             divergence_confidence_discount, make_ticker)
 from analysis.indicators import add_all_indicators, score_stock, compute_relative_strength
+from analysis.multi_factor import (compute_chip_score, compute_fundamental_score,
+                                   compute_sector_score, compute_rs60_score, combine_scores)
+from analysis.price_levels import compute_price_levels
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +86,21 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame,
 
     chip = chip_df.set_index("code") if "code" in chip_df.columns else chip_df
 
+    # Columns where TPEX genuinely has no data (data/fetcher_chip.py leaves
+    # these NaN on purpose — no 5-day figure, no margin day-over-day compare).
+    # Filling them to 0 here would make "unavailable" indistinguishable from
+    # "checked, and it's zero" for every downstream consumer: serialize_chip's
+    # null-honesty contract (analysis/common.py) and compute_chip_score's
+    # TPEX-vs-TWSE normalization (analysis/multi_factor.py) both depend on
+    # these staying NaN. Every other chip column defaults to 0 when a stock
+    # has no row at all (a real "no signal" default), so only these are exempt.
+    _NO_FAKE_ZERO = ("foreign_net_5d", "trust_net_5d", "big3_net_5d",
+                     "margin_prev", "margin_change_pct")
+
     # Attach chip data
     for col in chip_cols:
-        df[col] = df["code"].map(chip[col] if col in chip.columns else {}).fillna(0)
+        mapped = df["code"].map(chip[col] if col in chip.columns else {})
+        df[col] = mapped if col in _NO_FAKE_ZERO else mapped.fillna(0)
 
     def chip_signals(row) -> int:
         signals = 0
@@ -116,13 +132,25 @@ def stage2_chip(stage1_df: pd.DataFrame, chip_df: pd.DataFrame,
 
 def stage3_technical(stage2_df: pd.DataFrame,
                      history: dict[str, pd.DataFrame],
-                     fundamental: dict[str, dict] | None = None) -> pd.DataFrame:
+                     fundamental: dict[str, dict] | None = None,
+                     sector_score_map: dict | None = None,
+                     strategy: str = "balanced",
+                     rank_by: str = "tech_score") -> pd.DataFrame:
     """
     Score each candidate on technical indicators (+ relative strength vs TAIEX
-    and monthly-revenue growth when available).
-    Returns top STAGE3_TOP_N stocks with score >= STAGE3_MIN_SCORE.
+    and monthly-revenue growth when available), plus the multi-factor
+    chip/fundamental/sector/RS60 components (analysis/multi_factor.py).
+    Returns top STAGE3_TOP_N stocks with tech_score >= STAGE3_MIN_SCORE.
+
+    rank_by: "tech_score" (default) sorts by the pure technical score alone —
+    this is what fetch_backtest_picks relies on and must keep getting, so it
+    passes no arguments here and is unaffected by the multi-factor blend.
+    fetch_stock_candidates passes rank_by="total_score" to rank by the
+    strategy-weighted combination instead. Either way every component is
+    computed and returned for transparency; only the sort column differs.
     """
     fundamental = fundamental or {}
+    sector_score_map = sector_score_map or {}
     bench_df = history.get("^TWII")
 
     rows = []
@@ -139,24 +167,61 @@ def stage3_technical(stage2_df: pd.DataFrame,
         rs = compute_relative_strength(df_hist, bench_df)
         fund = fundamental.get(code, {})
         tech_score, tech_signals = score_stock(df_ind, rs=rs, fundamental=fund)
+        ind = extract_indicators(df_ind)
+
+        # Price-source reconciliation: universe close is the official close;
+        # yfinance close drives the indicators (KD/MACD/均線/RS all come from
+        # df_ind, built off yfinance history). Flag large divergences AND
+        # discount tech_score's confidence by how far off the two prints are
+        # — previously this only added a warning string; the score itself was
+        # untouched even though every indicator behind it may be off a
+        # different print. Applied before the STAGE3_MIN_SCORE gate so a
+        # stock that only clears the bar pre-discount doesn't sneak through.
+        official_close = stock.get("close", 0)
+        divergence = price_divergence_signal(official_close, ind.get("yf_close", 0))
+        if divergence:
+            tech_signals = list(tech_signals) + [divergence]
+            discount = divergence_confidence_discount(official_close, ind.get("yf_close", 0))
+            if discount < 1.0:
+                tech_score = round(tech_score * discount)
 
         if tech_score < STAGE3_MIN_SCORE:
             continue
 
-        ind = extract_indicators(df_ind)
+        # Multi-factor components — chip fields are already attached to `stock`
+        # by stage2_chip, so no extra lookup is needed.
+        price_levels = compute_price_levels(
+            close=stock.get("close", 0), ma5=ind.get("ma5"), ma20=ind.get("ma20"),
+            ma60=ind.get("ma60"), atr=ind.get("atr"), bias20=ind.get("bias20"),
+            rsi=ind.get("rsi"), bb_pct=ind.get("bb_pct"),
+        )
 
-        # Price-source reconciliation: universe close is the official close;
-        # yfinance close drives the indicators. Flag large divergences so the
-        # analyst knows the technical readout may be on a different print.
-        divergence = price_divergence_signal(stock.get("close", 0), ind.get("yf_close", 0))
-        if divergence:
-            tech_signals = list(tech_signals) + [divergence]
+        chip_score, chip_signals = compute_chip_score(stock)
+        fundamental_score, fundamental_signals = compute_fundamental_score(fund)
+        sector_score, sector_signal = compute_sector_score(stock.get("industry", ""), sector_score_map)
+        rs60_score, rs60_signal = compute_rs60_score(rs.get("rs60"))
+        total_score, combined_signals, breakdown = combine_scores(
+            tech_score, chip_score, fundamental_score, sector_score, rs60_score,
+            tech_signals, chip_signals, fundamental_signals, sector_signal, rs60_signal,
+            strategy=strategy,
+        )
 
         row = stock.to_dict()
         row.update(ind)
         row.update({
             "tech_score": tech_score,
             "tech_signals": tech_signals,
+            "total_score": total_score,
+            "combined_signals": combined_signals,
+            "score_breakdown": breakdown,
+            # Flat component scores (same numbers as score_breakdown, duplicated
+            # here so callers like data/recommendations.py can read them as plain
+            # DataFrame columns instead of coupling to score_breakdown's display keys).
+            "chip_score": chip_score,
+            "fundamental_score": fundamental_score,
+            "sector_score": sector_score,
+            "rs60_score": rs60_score,
+            "strategy": strategy,
             "rs20": rs.get("rs20"),
             "rs60": rs.get("rs60"),
             "rs_label": rs.get("rs_label", "—"),
@@ -164,6 +229,7 @@ def stage3_technical(stage2_df: pd.DataFrame,
             "rev_yoy": fund.get("rev_yoy"),
             "rev_mom": fund.get("rev_mom"),
             "rev_month": fund.get("rev_month"),
+            "price_levels": price_levels,
         })
         rows.append(row)
 
@@ -171,5 +237,5 @@ def stage3_technical(stage2_df: pd.DataFrame,
     if result.empty:
         return result
 
-    result = result.sort_values("tech_score", ascending=False)
+    result = result.sort_values(rank_by, ascending=False)
     return result.head(STAGE3_TOP_N).reset_index(drop=True)

@@ -51,6 +51,109 @@ def _pick_codes(n: int) -> list[tuple[str, str]]:
     return list(zip(df["code"], df["exchange"]))
 
 
+def _extract_signal_flags(df_ind: pd.DataFrame) -> dict[str, bool]:
+    """
+    Named boolean flags mirroring score_stock's conditions (analysis/indicators.py),
+    read at the most recent bar of df_ind. Used to isolate each signal's own
+    predictive power — score_stock's weights are hand-tuned; this measures
+    whether the weight roughly matches the signal's actual forward-return lift.
+    """
+    if df_ind is None or len(df_ind) < 2:
+        return {}
+    last, prev = df_ind.iloc[-1], df_ind.iloc[-2]
+
+    def v(row, col):
+        val = row.get(col, np.nan)
+        return float(val) if pd.notna(val) else np.nan
+
+    k, d, pk, pd_ = v(last, "K"), v(last, "D"), v(prev, "K"), v(prev, "D")
+    hist, phist = v(last, "MACD_hist"), v(prev, "MACD_hist")
+    ma5, ma10, ma20, ma60 = v(last, "MA5"), v(last, "MA10"), v(last, "MA20"), v(last, "MA60")
+    bias20 = v(last, "Bias20")
+    vol_ratio = v(last, "VolRatio")
+    rsi = v(last, "RSI")
+    bb_pct, bb_width, prev_bb_width = v(last, "BB_pct"), v(last, "BB_width"), v(prev, "BB_width")
+
+    return {
+        "KD超賣(<30)": not any(np.isnan([k, d])) and k < 30 and d < 30,
+        "KD黃金交叉": not any(np.isnan([pk, pd_, k, d])) and pk < pd_ and k >= d,
+        "MACD柱翻正": not any(np.isnan([hist, phist])) and hist > 0 and phist <= 0,
+        "MACD動能擴大": not any(np.isnan([hist, phist])) and hist > phist > 0,
+        "均線多頭排列": not any(np.isnan([ma5, ma10, ma20, ma60])) and ma5 > ma10 > ma20 > ma60,
+        "MA5>MA20": not any(np.isnan([ma5, ma20])) and ma5 > ma20,
+        "乖離健康(-3~5%)": not np.isnan(bias20) and -3 <= bias20 <= 5,
+        "乖離超賣(<-10%)": not np.isnan(bias20) and bias20 < -10,
+        "乖離過大(>15%)": not np.isnan(bias20) and bias20 > 15,
+        "爆量(>=3倍)": not np.isnan(vol_ratio) and vol_ratio >= 3.0,
+        "放量(>=1.5倍)": not np.isnan(vol_ratio) and vol_ratio >= 1.5,
+        "RSI超賣(<30)": not np.isnan(rsi) and rsi < 30,
+        "RSI超買(>70)": not np.isnan(rsi) and rsi > 70,
+        "布林下軌反彈": not np.isnan(bb_pct) and bb_pct < 0.1,
+        "布林擠壓突破": (not any(np.isnan([bb_width, prev_bb_width])) and prev_bb_width > 0
+                    and bb_width > prev_bb_width * 1.1 and not np.isnan(bb_pct) and bb_pct > 0.5),
+    }
+
+
+def factor_analysis(code_exchanges: list[tuple[str, str]], horizon: int, step: int,
+                    period: str) -> dict:
+    """
+    Isolate each named signal's own forward-return lift: for every sampled
+    (stock, day), record which signals fired, then split ALL forward returns
+    into "fired" vs "not fired" per signal. A signal whose fired-group average
+    clearly beats its not-fired-group average is pulling its weight; one that
+    doesn't is a candidate to reweight down in score_stock.
+    """
+    tickers = [f"{c}{'.TW' if e == 'TWSE' else '.TWO'}" for c, e in code_exchanges]
+    logger.info("factor-analysis: downloading %d tickers (%s)", len(tickers), period)
+    history = _download(tickers, period)
+
+    # {signal_name: {"fired": [returns], "not_fired": [returns]}}
+    buckets: dict[str, dict[str, list]] = {}
+
+    for ticker, df in history.items():
+        df_ind = add_all_indicators(df)
+        closes = df_ind["Close"].values
+        n = len(df_ind)
+        for i in range(60, n - horizon, step):
+            flags = _extract_signal_flags(df_ind.iloc[:i + 1])
+            if not flags:
+                continue
+            base = closes[i]
+            future = closes[i + horizon]
+            if base <= 0 or np.isnan(base) or np.isnan(future):
+                continue
+            ret = (future - base) / base * 100
+            for name, fired in flags.items():
+                b = buckets.setdefault(name, {"fired": [], "not_fired": []})
+                b["fired" if fired else "not_fired"].append(ret)
+
+    results = {}
+    for name, groups in buckets.items():
+        fired, not_fired = np.array(groups["fired"]), np.array(groups["not_fired"])
+        if len(fired) == 0 or len(not_fired) == 0:
+            continue
+        fired_avg, not_fired_avg = float(fired.mean()), float(not_fired.mean())
+        results[name] = {
+            "觸發樣本數": len(fired),
+            "觸發_平均報酬%": round(fired_avg, 2),
+            "觸發_勝率%": round(float((fired > 0).mean() * 100), 1),
+            "未觸發_平均報酬%": round(not_fired_avg, 2),
+            "效果量(觸發-未觸發)pp": round(fired_avg - not_fired_avg, 2),
+        }
+    return dict(sorted(results.items(), key=lambda kv: kv[1]["效果量(觸發-未觸發)pp"], reverse=True))
+
+
+def _print_factor_analysis(results: dict):
+    print(f"\n{'信號':<16} | {'樣本':>6} | {'觸發報酬/勝率':>16} | {'未觸發報酬':>10} | {'效果量pp':>8}")
+    print("-" * 70)
+    for name, r in results.items():
+        print(f"{name:<16} | {r['觸發樣本數']:>6} | "
+              f"{r['觸發_平均報酬%']:>6.2f}% /{r['觸發_勝率%']:>5.1f}% | "
+              f"{r['未觸發_平均報酬%']:>9.2f}% | {r['效果量(觸發-未觸發)pp']:>+7.2f}")
+    print("\n效果量(pp) 越大代表該信號的實證預測力越強——若目前 score_stock 給的權重與這裡")
+    print("的排序明顯不成比例（例如效果量很小卻給很高分），代表權重值得依此重新調整。")
+
+
 def _bucket(score: int) -> str:
     if score >= 55:
         return "高分(≥55)"
@@ -167,6 +270,9 @@ def main():
                    help="一次比較多個 horizon，逗號分隔，例如 5,10,20")
     p.add_argument("--step", type=int, default=5, help="取樣間隔（交易日）")
     p.add_argument("--period", type=str, default="2y", help="yfinance 歷史長度")
+    p.add_argument("--factor-analysis", action="store_true",
+                   help="逐一測量每個技術信號自己的未來報酬/勝率效果量，"
+                        "用實證數據檢查 score_stock 的手調權重是否合理")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -180,6 +286,13 @@ def main():
         code_exchanges = _pick_codes(args.stocks)
 
     import json
+
+    if args.factor_analysis:
+        results = factor_analysis(code_exchanges, args.horizon, args.step, args.period)
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        _print_factor_analysis(results)
+        return
+
     if args.compare_horizons:
         horizons = sorted({int(h) for h in args.compare_horizons.split(",") if h.strip()})
         results = backtest(code_exchanges, horizons, args.step, args.period)

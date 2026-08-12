@@ -18,6 +18,34 @@ logger = get_logger()
 _DB_PATH = Path(__file__).parent.parent / "recommendations.db"
 
 
+# Multi-factor component columns (analysis/multi_factor.py), added after the
+# original schema shipped — see _migrate_schema for why a plain
+# CREATE TABLE IF NOT EXISTS isn't enough for a database that already exists.
+_NEW_COLUMNS = {
+    "chip_score": "REAL",
+    "fundamental_score": "REAL",
+    "sector_score": "REAL",
+    "rs60": "REAL",
+    "total_score": "REAL",
+    "strategy": "TEXT",
+}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """
+    Add any of _NEW_COLUMNS missing from an existing `screened` table.
+    CREATE TABLE IF NOT EXISTS only handles a database that doesn't exist yet —
+    it silently no-ops against an older table missing newer columns, so ALTER
+    TABLE ADD COLUMN (guarded by PRAGMA table_info, since ADD COLUMN isn't
+    itself idempotent) is required to evolve an existing recommendations.db
+    without losing its history.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(screened)").fetchall()}
+    for col, col_type in _NEW_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE screened ADD COLUMN {col} {col_type}")
+
+
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_DB_PATH))
     conn.execute("""
@@ -34,11 +62,21 @@ def _conn() -> sqlite3.Connection:
             PRIMARY KEY (date, code)
         )
     """)
+    _migrate_schema(conn)
     return conn
 
 
 def save_screening(candidates: list[dict], date: str | None = None) -> int:
-    """Persist the day's screened candidates. Idempotent per (date, code)."""
+    """
+    Persist the day's screened candidates. Idempotent per (date, code).
+
+    Multi-factor component scores (chip_score/fundamental_score/sector_score/
+    rs60/total_score/strategy — analysis/multi_factor.py) are saved when
+    present so evaluate_performance() can eventually grade THOSE factors'
+    real forward returns too, not just tech_score. fetch_backtest_picks's
+    candidates don't carry these fields (it never computes them) and they're
+    simply stored as NULL — evaluate_performance already tolerates that.
+    """
     if not candidates:
         return 0
     date = date or taipei_now().strftime("%Y-%m-%d")
@@ -56,13 +94,20 @@ def save_screening(candidates: list[dict], date: str | None = None) -> int:
             _num(c.get("rs20")),
             _num(c.get("rev_yoy")),
             rank,
+            _num(c.get("chip_score")),
+            _num(c.get("fundamental_score")),
+            _num(c.get("sector_score")),
+            _num(c.get("rs60")),
+            _num(c.get("total_score")),
+            c.get("strategy"),
         ))
     try:
         with _conn() as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO screened "
-                "(date, code, name, exchange, close, tech_score, rs20, rev_yoy, rank) "
-                "VALUES (?,?,?,?,?,?,?,?,?)", rows)
+                "(date, code, name, exchange, close, tech_score, rs20, rev_yoy, rank, "
+                "chip_score, fundamental_score, sector_score, rs60, total_score, strategy) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         logger.debug("saved %d screened candidates for %s", len(rows), date)
         return len(rows)
     except Exception as e:

@@ -5,15 +5,16 @@ from analysis.common import exclude_etfs
 from config import PRICE_MIN, HOT_STOCK_PRICE_MAX, HOT_STOCK_MIN_TRADE_VALUE
 
 
-def compute_hot_sectors(universe_df: pd.DataFrame,
-                        chip_df: pd.DataFrame,
-                        top_n: int = 5) -> list[dict]:
+def _sector_groups(universe_df: pd.DataFrame, chip_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Rank industries by: % rising stocks, avg change%, institutional net buying.
-    Returns top_n sector dicts.
+    Shared groupby behind compute_hot_sectors (top_n display) and
+    compute_sector_score_map (every industry, for per-stock factor scoring).
+    Returns one row per industry with stock_count/up_count/down_count/
+    avg_change_pct/total_trade_value/foreign_net/trust_net/big3_net/up_ratio/score
+    (already filtered to stock_count >= 3, industry not blank/其他, ETFs excluded).
     """
     if universe_df.empty or "industry" not in universe_df.columns:
-        return []
+        return pd.DataFrame()
 
     df = exclude_etfs(universe_df.copy())
     df = df[df["industry"].str.strip() != ""]
@@ -51,6 +52,31 @@ def compute_hot_sectors(universe_df: pd.DataFrame,
         grouped["up_ratio"] * 5.0 +
         (grouped["big3_net"] > 0).astype(float) * 1.0
     )
+    return grouped
+
+
+def compute_sector_score_map(universe_df: pd.DataFrame, chip_df: pd.DataFrame) -> dict[str, float]:
+    """
+    {industry: raw score} for EVERY industry (not just the top_n compute_hot_sectors
+    displays) — used by analysis/multi_factor.py so a candidate can look up its own
+    industry's strength as a ranking factor, not just see the top-5 in isolation.
+    """
+    grouped = _sector_groups(universe_df, chip_df)
+    if grouped.empty:
+        return {}
+    return dict(zip(grouped["industry"], grouped["score"]))
+
+
+def compute_hot_sectors(universe_df: pd.DataFrame,
+                        chip_df: pd.DataFrame,
+                        top_n: int = 5) -> list[dict]:
+    """
+    Rank industries by: % rising stocks, avg change%, institutional net buying.
+    Returns top_n sector dicts.
+    """
+    grouped = _sector_groups(universe_df, chip_df)
+    if grouped.empty:
+        return []
 
     top = grouped.nlargest(top_n, "score")
 
